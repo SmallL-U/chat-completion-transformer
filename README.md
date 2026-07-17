@@ -123,6 +123,10 @@ The default listener is `127.0.0.1:8080`. If the gateway is exposed remotely,
 terminate TLS at a trusted reverse proxy before forwarding requests; otherwise
 the incoming bearer credential would travel over plaintext HTTP.
 
+Runtime logs are human-readable on stdout and are also written as JSON to
+`logs/server.log`. The file rotates at 100 MiB, and the current file plus its
+backups are limited to five files in total.
+
 ## Environment overrides
 
 Supported scalar values use `CCT_` names with underscores:

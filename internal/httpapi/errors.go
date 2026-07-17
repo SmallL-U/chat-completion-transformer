@@ -6,8 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -18,6 +18,7 @@ import (
 	"chat-completion-transformer/pkg/transformer"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 const diagnosticsTrailer = "X-Transformer-Diagnostics"
@@ -176,14 +177,17 @@ func writeAPIError(c *gin.Context, status int, message, errorType string, param,
 	}})
 }
 
-func recoveryMiddleware() gin.HandlerFunc {
+func recoveryMiddleware(logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {
 			recovered := recover()
 			if recovered == nil {
 				return
 			}
-			log.Printf("recovered HTTP panic (%T):\n%s", recovered, debug.Stack())
+			logger.Error("recovered HTTP panic",
+				zap.String("panic_type", fmt.Sprintf("%T", recovered)),
+				zap.ByteString("stack", debug.Stack()),
+			)
 			c.Abort()
 			if c.Writer.Written() {
 				return

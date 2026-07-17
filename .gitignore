@@ -14,3 +14,6 @@
 # AI context (keep folder, ignore contents)
 _ai_context/*
 !_ai_context/.gitkeep
+
+# Runtime logs
+logs/

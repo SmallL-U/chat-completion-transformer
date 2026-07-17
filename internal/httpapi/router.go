@@ -14,6 +14,7 @@ import (
 	"chat-completion-transformer/pkg/transformer"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 // Limits bounds the client request and provider response bodies.
@@ -34,12 +35,15 @@ type handler struct {
 }
 
 // NewRouter creates the gateway's public HTTP surface.
-func NewRouter(service *transformer.Transformer, client *upstream.Client, limits Limits) (*gin.Engine, error) {
+func NewRouter(service *transformer.Transformer, client *upstream.Client, limits Limits, logger *zap.Logger) (*gin.Engine, error) {
 	if service == nil {
 		return nil, errors.New("transformer is required")
 	}
 	if client == nil {
 		return nil, errors.New("upstream client is required")
+	}
+	if logger == nil {
+		return nil, errors.New("logger is required")
 	}
 	if limits.MaxBodyBytes <= 0 {
 		return nil, errors.New("max body bytes must be positive")
@@ -63,7 +67,8 @@ func NewRouter(service *transformer.Transformer, client *upstream.Client, limits
 	}
 	router := gin.New()
 	router.HandleMethodNotAllowed = true
-	router.Use(recoveryMiddleware())
+	httpLogger := logger.Named("http")
+	router.Use(requestLoggingMiddleware(httpLogger), recoveryMiddleware(httpLogger))
 	router.GET("/healthz", h.health)
 	router.POST("/v1/chat/completions", h.chatCompletions)
 	router.NoRoute(func(c *gin.Context) {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,19 +11,46 @@ import (
 
 	"chat-completion-transformer/internal/config"
 	"chat-completion-transformer/internal/httpapi"
+	"chat-completion-transformer/internal/logging"
 	"chat-completion-transformer/internal/upstream"
 	"chat-completion-transformer/pkg/transformer"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 func main() {
-	if err := run(); err != nil {
-		log.Fatal(err)
-	}
+	os.Exit(realMain())
 }
 
-func run() error {
+func realMain() int {
+	applicationLogger, err := logging.New()
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "initialize logger: %v\n", err)
+		return 1
+	}
+	runErr := run(applicationLogger.Logger)
+	if runErr != nil {
+		applicationLogger.Error("server stopped with error", zap.Error(runErr))
+	}
+	closeErr := applicationLogger.Close()
+	if closeErr != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "close logger: %v\n", closeErr)
+	}
+	if runErr != nil {
+		return 1
+	}
+	if closeErr != nil {
+		return 1
+	}
+	return 0
+}
+
+func run(logger *zap.Logger) error {
+	if logger == nil {
+		return errors.New("logger is required")
+	}
+
 	settings, err := config.Load("config.yml")
 	if err != nil {
 		return err
@@ -52,9 +78,13 @@ func run() error {
 	router, err := httpapi.NewRouter(service, upstreamClient, httpapi.Limits{
 		MaxBodyBytes:   settings.Server.MaxBodyBytes,
 		MaxStreamBytes: settings.Server.MaxStreamBytes,
-	})
+	}, logger)
 	if err != nil {
 		return fmt.Errorf("create HTTP router: %w", err)
+	}
+	serverErrorLogger, err := zap.NewStdLogAt(logger.Named("http.server"), zap.ErrorLevel)
+	if err != nil {
+		return fmt.Errorf("create HTTP server logger: %w", err)
 	}
 
 	server := &http.Server{
@@ -62,11 +92,13 @@ func run() error {
 		Handler:           router,
 		ReadHeaderTimeout: settings.Server.ReadHeaderTimeout,
 		IdleTimeout:       settings.Server.IdleTimeout,
+		ErrorLog:          serverErrorLogger,
 	}
 	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
 	serveErrors := make(chan error, 1)
+	logger.Info("starting HTTP server", zap.String("address", settings.Server.Address))
 	go func() {
 		serveErrors <- server.ListenAndServe()
 	}()
@@ -77,6 +109,7 @@ func run() error {
 	case <-signalContext.Done():
 	}
 
+	logger.Info("shutting down HTTP server")
 	shutdownContext, cancelShutdown := context.WithTimeout(context.WithoutCancel(signalContext), settings.Server.ShutdownTimeout)
 	defer cancelShutdown()
 	shutdownErr := server.Shutdown(shutdownContext)

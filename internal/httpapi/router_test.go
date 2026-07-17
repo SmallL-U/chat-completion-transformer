@@ -19,6 +19,8 @@ import (
 	"chat-completion-transformer/pkg/transformer"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 const testBodyLimit = 1 << 20
@@ -61,8 +63,9 @@ func TestRouterPublicSurface(t *testing.T) {
 }
 
 func TestRecoveryReturnsOpenAIErrorEnvelope(t *testing.T) {
+	core, logs := observer.New(zap.ErrorLevel)
 	router := gin.New()
-	router.Use(recoveryMiddleware())
+	router.Use(recoveryMiddleware(zap.New(core)))
 	router.GET("/panic", func(*gin.Context) {
 		panic("test panic")
 	})
@@ -72,6 +75,71 @@ func TestRecoveryReturnsOpenAIErrorEnvelope(t *testing.T) {
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "internal_server_error") {
 		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	entries := logs.All()
+	if len(entries) != 1 {
+		t.Fatalf("panic log entries = %d, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	panicType, panicTypeOK := fields["panic_type"].(string)
+	stack, stackOK := fields["stack"].(string)
+	if !panicTypeOK || panicType != "string" || !stackOK || stack == "" {
+		t.Fatalf("panic log fields = %#v", fields)
+	}
+}
+
+func TestRequestLoggingUsesRoutePattern(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	router := gin.New()
+	router.Use(requestLoggingMiddleware(zap.New(core)))
+	router.GET("/items/:id", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/items/private-value?token=secret", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	entries := logs.All()
+	if len(entries) != 1 {
+		t.Fatalf("request log entries = %d, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["path"] != "/items/:id" || fields["status"] != int64(http.StatusNoContent) {
+		t.Fatalf("request log fields = %#v", fields)
+	}
+	encodedFields, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if strings.Contains(string(encodedFields), "private-value") || strings.Contains(string(encodedFields), "secret") {
+		t.Fatalf("request log contains raw URL data: %s", encodedFields)
+	}
+}
+
+func TestRequestLoggingRedactsUnmatchedPath(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	router := gin.New()
+	router.Use(requestLoggingMiddleware(zap.New(core)))
+
+	request := httptest.NewRequest(http.MethodGet, "/private-value?token=secret", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	entries := logs.All()
+	if len(entries) != 1 {
+		t.Fatalf("request log entries = %d, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["path"] != "<unmatched>" {
+		t.Fatalf("request log fields = %#v", fields)
+	}
+	encodedFields, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if strings.Contains(string(encodedFields), "private-value") || strings.Contains(string(encodedFields), "secret") {
+		t.Fatalf("request log contains raw URL data: %s", encodedFields)
 	}
 }
 
@@ -873,7 +941,7 @@ func newTestRouterWithConfiguredLimits(t *testing.T, providerURL string, limits 
 	if err != nil {
 		t.Fatal(err)
 	}
-	router, err := NewRouter(service, client, limits)
+	router, err := NewRouter(service, client, limits, zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}
