@@ -1,5 +1,7 @@
 # Chat Completion Transformer
 
+English | [简体中文](README.zh-CN.md)
+
 Go service and library for translating Chat Completions requests to OpenAI
 Responses or Anthropic Messages, and translating provider responses and SSE
 streams back to the Chat Completions shape.
