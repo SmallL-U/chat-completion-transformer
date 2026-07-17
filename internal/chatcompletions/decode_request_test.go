@@ -25,7 +25,8 @@ func TestDecodeRequestPreservesMessageAndToolSemantics(t *testing.T) {
 		"max_tokens":100,
 		"max_completion_tokens":80,
 		"stop":"END",
-		"stream":true
+		"stream":true,
+		"stream_options":{"include_usage":true}
 	}`))
 
 	if !result.OK || result.Value == nil {
@@ -52,8 +53,8 @@ func TestDecodeRequestPreservesMessageAndToolSemantics(t *testing.T) {
 	if request.MaxOutputTokens == nil || *request.MaxOutputTokens != 80 {
 		t.Fatalf("max tokens = %v", request.MaxOutputTokens)
 	}
-	if len(request.StopSequences) != 1 || request.StopSequences[0] != "END" || !request.Stream {
-		t.Fatalf("stop/stream = %#v/%t", request.StopSequences, request.Stream)
+	if len(request.StopSequences) != 1 || request.StopSequences[0] != "END" || !request.Stream || !request.StreamIncludeUsage {
+		t.Fatalf("stop/stream = %#v/%t include_usage=%t", request.StopSequences, request.Stream, request.StreamIncludeUsage)
 	}
 	if request.ParallelToolCalls == nil || *request.ParallelToolCalls {
 		t.Fatalf("parallel = %v", request.ParallelToolCalls)
@@ -95,6 +96,13 @@ func TestDecodeRequestChoicesAndFormats(t *testing.T) {
 				t.Fatalf("format = %#v", result.Value.OutputFormat)
 			}
 		})
+	}
+}
+
+func TestDecodeRequestRejectsStreamOptionsWithoutStreaming(t *testing.T) {
+	result := DecodeRequest([]byte(`{"model":"general","messages":[{"role":"user","content":"hello"}],"stream_options":{"include_usage":true}}`))
+	if result.OK || !containsDiagnostic(result.Diagnostics, diagnosticInvalidRequest) {
+		t.Fatalf("result = %#v", result)
 	}
 }
 

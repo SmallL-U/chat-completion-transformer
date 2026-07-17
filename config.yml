@@ -1,5 +1,5 @@
 server:
-  address: ":8080"
+  address: "127.0.0.1:8080"
   gin_mode: "release"
   read_header_timeout: "5s"
   idle_timeout: "1m"
@@ -7,6 +7,11 @@ server:
   max_body_bytes: 1048576
   max_stream_bytes: 67108864
   max_sse_event_bytes: 8388608
+
+gateway:
+  response_header_timeout: "5m"
+  upstreams: {}
+  routes: {}
 
 transformer:
   mode: "compatible"

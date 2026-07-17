@@ -81,13 +81,14 @@ const (
 	OutputFormatJSONObject = canonical.OutputFormatJSONObject
 	OutputFormatJSONSchema = canonical.OutputFormatJSONSchema
 
-	FinishReasonStop      = canonical.FinishReasonStop
-	FinishReasonLength    = canonical.FinishReasonLength
-	FinishReasonToolCalls = canonical.FinishReasonToolCalls
-	FinishReasonRefusal   = canonical.FinishReasonRefusal
-	FinishReasonPause     = canonical.FinishReasonPause
-	FinishReasonError     = canonical.FinishReasonError
-	FinishReasonUnknown   = canonical.FinishReasonUnknown
+	FinishReasonStop          = canonical.FinishReasonStop
+	FinishReasonLength        = canonical.FinishReasonLength
+	FinishReasonToolCalls     = canonical.FinishReasonToolCalls
+	FinishReasonContentFilter = canonical.FinishReasonContentFilter
+	FinishReasonRefusal       = canonical.FinishReasonRefusal
+	FinishReasonPause         = canonical.FinishReasonPause
+	FinishReasonError         = canonical.FinishReasonError
+	FinishReasonUnknown       = canonical.FinishReasonUnknown
 
 	EventResponseStart      = canonical.EventResponseStart
 	EventTextDelta          = canonical.EventTextDelta

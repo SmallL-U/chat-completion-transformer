@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"chat-completion-transformer/internal/capabilities"
+	"chat-completion-transformer/internal/upstream"
 
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/spf13/viper"
@@ -28,6 +29,7 @@ var scalarKeys = []string{
 	"server.max_body_bytes",
 	"server.max_stream_bytes",
 	"server.max_sse_event_bytes",
+	"gateway.response_header_timeout",
 	"transformer.mode",
 	"transformer.instruction_policy",
 	"transformer.anthropic_endpoint",
@@ -37,6 +39,7 @@ const defaultMaxOutputTokensEnvironment = "CCT_TRANSFORMER_DEFAULT_MAX_OUTPUT_TO
 
 type Config struct {
 	Server      ServerConfig      `json:"server"`
+	Gateway     upstream.Settings `json:"gateway"`
 	Transformer TransformerConfig `json:"transformer"`
 }
 
@@ -128,19 +131,30 @@ func bindScalarEnvironment(v *viper.Viper) error {
 }
 
 func applyJSONEnvironment(v *viper.Viper) error {
-	if err := applyJSONOverride[[]capabilities.Profile](v, "transformer.profiles", "CCT_TRANSFORMER_PROFILES"); err != nil {
+	if err := applyJSONOverride(v, "gateway.upstreams", "CCT_GATEWAY_UPSTREAMS", map[string]upstream.Config{}); err != nil {
 		return err
 	}
-	if err := applyJSONOverride[[]capabilities.ModelRoute](v, "transformer.routes", "CCT_TRANSFORMER_ROUTES"); err != nil {
+	if err := applyJSONOverride(v, "gateway.routes", "CCT_GATEWAY_ROUTES", map[string]string{}); err != nil {
+		return err
+	}
+	if err := applyJSONOverride(v, "transformer.profiles", "CCT_TRANSFORMER_PROFILES", []capabilities.Profile{}); err != nil {
+		return err
+	}
+	if err := applyJSONOverride(v, "transformer.routes", "CCT_TRANSFORMER_ROUTES", []capabilities.ModelRoute{}); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func applyJSONOverride[T any](v *viper.Viper, key, environment string) error {
+func applyJSONOverride[T any](v *viper.Viper, key, environment string, empty T) error {
 	raw, ok := os.LookupEnv(environment)
 	if !ok {
+		return nil
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.EqualFold(trimmed, "null") {
+		v.Set(key, empty)
 		return nil
 	}
 

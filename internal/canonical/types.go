@@ -148,20 +148,21 @@ type OutputFormat struct {
 
 // Request is the canonical form of a chat-completion request.
 type Request struct {
-	ModelAlias        string            `json:"model_alias"`
-	Turns             []Turn            `json:"turns"`
-	Tools             []ToolDefinition  `json:"tools"`
-	ToolChoice        *ToolChoice       `json:"tool_choice,omitempty"`
-	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
-	MaxOutputTokens   *int              `json:"max_output_tokens,omitempty"`
-	Temperature       *float64          `json:"temperature,omitempty"`
-	TopP              *float64          `json:"top_p,omitempty"`
-	StopSequences     []string          `json:"stop_sequences,omitempty"`
-	CandidateCount    *int              `json:"candidate_count,omitempty"`
-	OutputFormat      *OutputFormat     `json:"output_format,omitempty"`
-	Stream            bool              `json:"stream"`
-	Metadata          map[string]string `json:"metadata,omitempty"`
-	Extensions        Object            `json:"extensions,omitempty"`
+	ModelAlias         string            `json:"model_alias"`
+	Turns              []Turn            `json:"turns"`
+	Tools              []ToolDefinition  `json:"tools"`
+	ToolChoice         *ToolChoice       `json:"tool_choice,omitempty"`
+	ParallelToolCalls  *bool             `json:"parallel_tool_calls,omitempty"`
+	MaxOutputTokens    *int              `json:"max_output_tokens,omitempty"`
+	Temperature        *float64          `json:"temperature,omitempty"`
+	TopP               *float64          `json:"top_p,omitempty"`
+	StopSequences      []string          `json:"stop_sequences,omitempty"`
+	CandidateCount     *int              `json:"candidate_count,omitempty"`
+	OutputFormat       *OutputFormat     `json:"output_format,omitempty"`
+	Stream             bool              `json:"stream"`
+	StreamIncludeUsage bool              `json:"stream_include_usage"`
+	Metadata           map[string]string `json:"metadata,omitempty"`
+	Extensions         Object            `json:"extensions,omitempty"`
 }
 
 // Usage contains provider-reported token counts. A nil field means the
@@ -177,13 +178,14 @@ type Usage struct {
 type FinishReason string
 
 const (
-	FinishReasonStop      FinishReason = "stop"
-	FinishReasonLength    FinishReason = "length"
-	FinishReasonToolCalls FinishReason = "tool_calls"
-	FinishReasonRefusal   FinishReason = "refusal"
-	FinishReasonPause     FinishReason = "pause"
-	FinishReasonError     FinishReason = "error"
-	FinishReasonUnknown   FinishReason = "unknown"
+	FinishReasonStop          FinishReason = "stop"
+	FinishReasonLength        FinishReason = "length"
+	FinishReasonToolCalls     FinishReason = "tool_calls"
+	FinishReasonContentFilter FinishReason = "content_filter"
+	FinishReasonRefusal       FinishReason = "refusal"
+	FinishReasonPause         FinishReason = "pause"
+	FinishReasonError         FinishReason = "error"
+	FinishReasonUnknown       FinishReason = "unknown"
 )
 
 // Output is one complete response candidate.

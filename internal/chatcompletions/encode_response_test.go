@@ -100,6 +100,32 @@ func TestEncodeResponseDoesNotCallRefusalContentFilter(t *testing.T) {
 	}
 }
 
+func TestEncodeResponseMapsContentFilterExactly(t *testing.T) {
+	model := "target-model"
+	result := EncodeResponse(canonical.Response{
+		ID:    "response_1",
+		Model: &model,
+		Outputs: []canonical.Output{{
+			FinishReason: canonical.FinishReasonContentFilter,
+		}},
+	}, ResponseEncodeOptions{Mode: canonical.ModeStrict, Created: 1})
+	if !result.OK || result.Value == nil || !result.Lossless {
+		t.Fatalf("result = %#v", result)
+	}
+
+	var response struct {
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(*result.Value, &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Choices) != 1 || response.Choices[0].FinishReason != "content_filter" {
+		t.Fatalf("response = %#v", response)
+	}
+}
+
 func TestEncodeResponseIncludesTextRefusalToolsAndProviderReasonDiagnostic(t *testing.T) {
 	model := "target-model"
 	providerReason := "provider \"quoted\"\nreason"

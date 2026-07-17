@@ -9,7 +9,7 @@ import (
 )
 
 func TestStreamEncoderTextToolsUsageAndFinish(t *testing.T) {
-	encoder := NewStreamEncoder(StreamEncodeOptions{Mode: canonical.ModeCompatible, Created: 123})
+	encoder := NewStreamEncoder(StreamEncodeOptions{Mode: canonical.ModeCompatible, Created: 123, IncludeUsage: true})
 	model := "target-model"
 	indexNine := 9
 	indexTwo := 2
@@ -62,6 +62,12 @@ func TestStreamEncoderTextToolsUsageAndFinish(t *testing.T) {
 	usageChoices := chunks[len(chunks)-1]["choices"].([]any)
 	if len(usageChoices) != 0 {
 		t.Fatalf("usage choices = %#v", usageChoices)
+	}
+	for index, chunk := range chunks[:len(chunks)-1] {
+		usage, exists := chunk["usage"]
+		if !exists || usage != nil {
+			t.Fatalf("chunk %d usage = %#v, present = %t; want null", index, usage, exists)
+		}
 	}
 
 	joined := joinFrames(frames)
@@ -140,7 +146,7 @@ func TestStreamEncoderStrictFinishFailureCanBeRetried(t *testing.T) {
 }
 
 func TestStreamEncoderMergesUsageEvents(t *testing.T) {
-	encoder := NewStreamEncoder(StreamEncodeOptions{FallbackID: "id", FallbackModel: "model"})
+	encoder := NewStreamEncoder(StreamEncodeOptions{FallbackID: "id", FallbackModel: "model", IncludeUsage: true})
 	inputTokens := int64(10)
 	outputTokens := int64(5)
 	totalTokens := int64(15)
@@ -171,6 +177,24 @@ func TestStreamEncoderMergesUsageEvents(t *testing.T) {
 	}
 	if len(chunk.Choices) != 0 || chunk.Usage["prompt_tokens"] != 10 || chunk.Usage["completion_tokens"] != 5 || chunk.Usage["total_tokens"] != 15 {
 		t.Fatalf("usage chunk = %#v", chunk)
+	}
+}
+
+func TestStreamEncoderOmitsUsageByDefault(t *testing.T) {
+	encoder := NewStreamEncoder(StreamEncodeOptions{FallbackID: "id", FallbackModel: "model"})
+	inputTokens := int64(10)
+	usage := encoder.Encode(canonical.Event{Type: canonical.EventUsage, Usage: &canonical.Usage{InputTokens: &inputTokens}})
+	if !usage.OK {
+		t.Fatalf("usage = %#v", usage)
+	}
+
+	reason := canonical.FinishReasonStop
+	result := encoder.Encode(canonical.Event{Type: canonical.EventFinish, Reason: &reason})
+	if !result.OK || result.Value == nil || len(*result.Value) != 3 {
+		t.Fatalf("finish = %#v", result)
+	}
+	if strings.Contains(joinFrames(*result.Value), `"usage":`) {
+		t.Fatalf("usage was emitted without include_usage: %s", joinFrames(*result.Value))
 	}
 }
 

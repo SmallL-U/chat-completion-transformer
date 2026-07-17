@@ -223,6 +223,9 @@ func responseFinishReason(
 		if reason == "max_output_tokens" || reason == "max_tokens" {
 			return canonical.FinishReasonLength, &reason
 		}
+		if reason == "content_filter" {
+			return canonical.FinishReasonContentFilter, &reason
+		}
 		return canonical.FinishReasonUnknown, &reason
 	case "queued", "in_progress":
 		reason := status

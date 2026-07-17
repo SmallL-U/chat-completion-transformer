@@ -29,6 +29,33 @@ func (config Config) Validate() error {
 	if err := config.Transformer.validate(); err != nil {
 		return fmt.Errorf("transformer: %w", err)
 	}
+	if err := config.Gateway.Validate(); err != nil {
+		return fmt.Errorf("gateway: %w", err)
+	}
+	if err := validateGatewayRoutes(config); err != nil {
+		return fmt.Errorf("gateway: %w", err)
+	}
+
+	return nil
+}
+
+func validateGatewayRoutes(config Config) error {
+	registry := capabilities.NewRegistry()
+	for _, route := range config.Transformer.Routes {
+		if err := registry.RegisterRoute(route); err != nil {
+			return err
+		}
+	}
+
+	for alias, upstreamName := range config.Gateway.Routes {
+		target := config.Gateway.Upstreams[upstreamName]
+		if target.Endpoint == capabilities.EndpointMessages && config.Transformer.AnthropicEndpoint != capabilities.EndpointMessages {
+			return fmt.Errorf("route %q uses direct messages but transformer.anthropic_endpoint is %q", alias, config.Transformer.AnthropicEndpoint)
+		}
+		if _, err := registry.Resolve(alias, target.Endpoint); err != nil {
+			return fmt.Errorf("route %q: %w", alias, err)
+		}
+	}
 
 	return nil
 }

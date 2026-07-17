@@ -45,6 +45,12 @@ func DecodeRequest(input []byte) canonical.Result[canonical.Request] {
 	if stream := optional[bool](take(object, "stream"), "stream", &diagnostics); stream != nil {
 		request.Stream = *stream
 	}
+	streamOptionsRaw := take(object, "stream_options")
+	streamIncludeUsage, streamOptionExtensions := decodeStreamOptions(streamOptionsRaw, &diagnostics)
+	request.StreamIncludeUsage = streamIncludeUsage
+	if len(streamOptionsRaw) > 0 && !request.Stream {
+		diagnostics = append(diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "stream_options requires stream to be true", "stream_options", streamOptionsRaw))
+	}
 	request.Metadata = decodeMetadata(take(object, "metadata"), &diagnostics)
 
 	if request.CandidateCount != nil && *request.CandidateCount < 1 {
@@ -55,6 +61,9 @@ func DecodeRequest(input []byte) canonical.Result[canonical.Request] {
 	}
 
 	request.Extensions = object
+	for name, raw := range streamOptionExtensions {
+		request.Extensions["chat_completions.stream_options."+name] = raw
+	}
 	for name, raw := range object {
 		diagnostics = append(diagnostics, diagnostic(
 			canonical.SeverityWarning,
@@ -66,6 +75,21 @@ func DecodeRequest(input []byte) canonical.Result[canonical.Request] {
 	}
 
 	return canonical.Success(request, diagnostics)
+}
+
+func decodeStreamOptions(raw json.RawMessage, diagnostics *[]canonical.Diagnostic) (bool, canonical.Object) {
+	if len(raw) == 0 {
+		return false, nil
+	}
+
+	object, err := canonical.DecodeObject(raw)
+	if err != nil {
+		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "stream_options must be an object", "stream_options", raw))
+		return false, nil
+	}
+
+	includeUsage := optional[bool](take(object, "include_usage"), "stream_options.include_usage", diagnostics)
+	return includeUsage != nil && *includeUsage, object
 }
 
 func decodeMessages(raw json.RawMessage, diagnostics *[]canonical.Diagnostic) []canonical.Turn {

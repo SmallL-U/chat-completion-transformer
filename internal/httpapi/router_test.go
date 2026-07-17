@@ -10,339 +10,953 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"chat-completion-transformer/internal/capabilities"
+	"chat-completion-transformer/internal/upstream"
 	"chat-completion-transformer/pkg/transformer"
+
+	"github.com/gin-gonic/gin"
 )
 
 const testBodyLimit = 1 << 20
 
-func TestRouterHealth(t *testing.T) {
-	router := newTestRouter(t, newTestTransformer(t, nil), Limits{MaxBodyBytes: testBodyLimit, MaxStreamBytes: testBodyLimit})
-	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+func TestRouterPublicSurface(t *testing.T) {
+	provider := httptest.NewServer(http.NotFoundHandler())
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	healthRequest := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	healthResponse := httptest.NewRecorder()
+	router.ServeHTTP(healthResponse, healthRequest)
+	if healthResponse.Code != http.StatusOK || strings.TrimSpace(healthResponse.Body.String()) != `{"status":"ok"}` {
+		t.Fatalf("health response = %d %s", healthResponse.Code, healthResponse.Body.String())
+	}
+
+	methodRequest := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
+	methodResponse := httptest.NewRecorder()
+	router.ServeHTTP(methodResponse, methodRequest)
+	if methodResponse.Code != http.StatusMethodNotAllowed || !strings.Contains(methodResponse.Body.String(), "method_not_allowed") {
+		t.Fatalf("method response = %d %s", methodResponse.Code, methodResponse.Body.String())
+	}
+
+	legacyPaths := []string{
+		"/v1/transform/chat-completions/to/openai-responses",
+		"/v1/transform/chat-completions/to/anthropic-messages",
+		"/v1/transform/openai-responses/to/chat-completions",
+		"/v1/transform/anthropic-messages/to/chat-completions",
+		"/v1/transform/openai-responses/sse/to/chat-completions",
+		"/v1/transform/anthropic-messages/sse/to/chat-completions",
+	}
+	for _, path := range legacyPaths {
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), "not_found") {
+			t.Fatalf("POST %s = %d %s, want OpenAI-shaped 404", path, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestRecoveryReturnsOpenAIErrorEnvelope(t *testing.T) {
+	router := gin.New()
+	router.Use(recoveryMiddleware())
+	router.GET("/panic", func(*gin.Context) {
+		panic("test panic")
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/panic", nil)
 	response := httptest.NewRecorder()
-
 	router.ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK || strings.TrimSpace(response.Body.String()) != `{"status":"ok"}` {
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "internal_server_error") {
 		t.Fatalf("response = %d %s", response.Code, response.Body.String())
 	}
 }
 
-func TestRouterJSONTransforms(t *testing.T) {
-	service := newTestTransformer(t, nil)
-	router := newTestRouter(t, service, Limits{MaxBodyBytes: testBodyLimit, MaxStreamBytes: testBodyLimit})
-	tests := []struct {
-		name        string
-		path        string
-		body        string
-		assertValue func(*testing.T, json.RawMessage)
-	}{
-		{
-			name: "chat request to Responses",
-			path: "/v1/transform/chat-completions/to/openai-responses",
-			body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":12}`,
-			assertValue: func(t *testing.T, raw json.RawMessage) {
-				t.Helper()
-				assertJSONField(t, raw, "model", "openai-target")
-			},
-		},
-		{
-			name: "chat request to Anthropic",
-			path: "/v1/transform/chat-completions/to/anthropic-messages",
-			body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":12}`,
-			assertValue: func(t *testing.T, raw json.RawMessage) {
-				t.Helper()
-				assertJSONField(t, raw, "model", "anthropic-target")
-			},
-		},
-		{
-			name: "Responses response to chat",
-			path: "/v1/transform/openai-responses/to/chat-completions",
-			body: `{"id":"resp_1","created_at":123,"model":"gpt-test","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]}]}]}`,
-			assertValue: func(t *testing.T, raw json.RawMessage) {
-				t.Helper()
-				assertJSONField(t, raw, "object", "chat.completion")
-			},
-		},
-		{
-			name: "Anthropic response to chat",
-			path: "/v1/transform/anthropic-messages/to/chat-completions",
-			body: `{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}`,
-			assertValue: func(t *testing.T, raw json.RawMessage) {
-				t.Helper()
-				assertJSONField(t, raw, "object", "chat.completion")
-			},
-		},
-	}
+func TestRouterBufferedProviders(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		writer.Header().Set("Content-Type", "application/json")
 
+		switch request.URL.Path {
+		case "/v1/responses":
+			if request.Header.Get("Authorization") != "Bearer client-openai-key" {
+				t.Errorf("OpenAI Authorization = %q", request.Header.Get("Authorization"))
+			}
+			if body["model"] != "openai-target" || body["stream"] != false {
+				t.Errorf("OpenAI request = %#v", body)
+			}
+			_, _ = io.WriteString(writer, responsesResponse())
+		case "/v1/messages":
+			if request.Header.Get("x-api-key") != "client-anthropic-key" {
+				t.Errorf("Anthropic x-api-key = %q", request.Header.Get("x-api-key"))
+			}
+			if request.Header.Get("Authorization") != "" {
+				t.Errorf("Anthropic Authorization must not be forwarded")
+			}
+			if request.Header.Get("anthropic-version") != upstream.DefaultAnthropicVersion {
+				t.Errorf("Anthropic version = %q", request.Header.Get("anthropic-version"))
+			}
+			if body["model"] != "anthropic-target" || body["stream"] != false {
+				t.Errorf("Anthropic request = %#v", body)
+			}
+			_, _ = io.WriteString(writer, anthropicResponse())
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	tests := []struct {
+		name   string
+		model  string
+		apiKey string
+	}{
+		{name: "OpenAI Responses", model: "openai-chat", apiKey: "client-openai-key"},
+		{name: "Anthropic Messages", model: "anthropic-chat", apiKey: "client-anthropic-key"},
+	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body))
+			body := `{"model":"` + test.model + `","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":12}`
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			request.Header.Set("Authorization", "Bearer "+test.apiKey)
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
 
 			if response.Code != http.StatusOK {
 				t.Fatalf("response = %d %s", response.Code, response.Body.String())
 			}
-			var result struct {
-				OK          bool                     `json:"ok"`
-				Lossless    bool                     `json:"lossless"`
-				Value       json.RawMessage          `json:"value"`
-				Diagnostics []transformer.Diagnostic `json:"diagnostics"`
-			}
+			var result map[string]any
 			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 				t.Fatal(err)
 			}
-			if !result.OK || result.Value == nil || result.Diagnostics == nil {
-				t.Fatalf("result = %#v", result)
+			if result["object"] != "chat.completion" {
+				t.Fatalf("response is not a Chat Completion: %#v", result)
 			}
-			test.assertValue(t, result.Value)
+			if _, wrapped := result["value"]; wrapped {
+				t.Fatalf("response still contains transform envelope: %#v", result)
+			}
 		})
 	}
 }
 
-func TestRouterRejectsOversizedJSONBody(t *testing.T) {
-	router := newTestRouter(t, newTestTransformer(t, nil), Limits{MaxBodyBytes: 8, MaxStreamBytes: testBodyLimit})
-	request := httptest.NewRequest(http.MethodPost, "/v1/transform/openai-responses/to/chat-completions", strings.NewReader(`{"more":"than eight bytes"}`))
+func TestRouterDoesNotTurnFailedResponseIntoCompletion(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"id":"resp_failed","status":"failed","output":[],"error":{"code":"server_error","message":"provider failed"}}`)
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Authorization", "Bearer client-key")
 	response := httptest.NewRecorder()
-
 	router.ServeHTTP(response, request)
-
-	if response.Code != http.StatusRequestEntityTooLarge || !strings.Contains(response.Body.String(), "request_body_too_large") {
+	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "provider failed") || !strings.Contains(response.Body.String(), "server_error") {
 		t.Fatalf("response = %d %s", response.Code, response.Body.String())
 	}
 }
 
-func TestRouterRejectsUnsupportedFullDuplex(t *testing.T) {
-	router := newTestRouter(t, newTestTransformer(t, nil), Limits{MaxBodyBytes: testBodyLimit, MaxStreamBytes: testBodyLimit})
-	request := httptest.NewRequest(http.MethodPost, "/v1/transform/openai-responses/sse/to/chat-completions", strings.NewReader(responsesTextStream()))
+func TestRouterPreservesContentFilterFinishReason(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"id":"resp_filtered","created_at":123,"model":"gpt-test","status":"incomplete","output":[],"incomplete_details":{"reason":"content_filter"}}`)
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Authorization", "Bearer client-key")
 	response := httptest.NewRecorder()
-
 	router.ServeHTTP(response, request)
-
-	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "full_duplex_unavailable") {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"finish_reason":"content_filter"`) {
 		t.Fatalf("response = %d %s", response.Code, response.Body.String())
 	}
 }
 
-func TestRouterStreamsArbitraryChunksAndFlushes(t *testing.T) {
-	service := newTestTransformer(t, nil)
-	router := newTestRouter(t, service, Limits{MaxBodyBytes: testBodyLimit, MaxStreamBytes: testBodyLimit})
-	tests := []struct {
-		name string
-		path string
-		body string
-	}{
-		{
-			name: "Responses",
-			path: "/v1/transform/openai-responses/sse/to/chat-completions",
-			body: responsesTextStream(),
-		},
-		{
-			name: "Anthropic",
-			path: "/v1/transform/anthropic-messages/sse/to/chat-completions",
-			body: anthropicTextStream(),
-		},
-	}
+func TestRouterPreservesStreamContentFilterFinishReason(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer,
+			responsesFrame("response.created", `{"type":"response.created","response":{"id":"resp_filtered","created_at":123,"model":"gpt-test","status":"in_progress","output":[]}}`)+
+				responsesFrame("response.incomplete", `{"type":"response.incomplete","response":{"id":"resp_filtered","created_at":123,"model":"gpt-test","status":"incomplete","output":[],"incomplete_details":{"reason":"content_filter"}}}`),
+		)
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodPost, test.path, io.NopCloser(&oneByteReader{value: []byte(test.body)}))
-			response := newFullDuplexRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}],"stream":true}`))
+	request.Header.Set("Authorization", "Bearer client-key")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"finish_reason":"content_filter"`) || !strings.HasSuffix(response.Body.String(), "data: [DONE]\n\n") {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestRouterStreamsProviders(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		if request.URL.Path == "/v1/responses" {
+			_, _ = io.WriteString(writer, responsesTextStream())
+			return
+		}
+		if request.URL.Path == "/v1/messages" {
+			_, _ = io.WriteString(writer, anthropicTextStream())
+			return
+		}
+		http.NotFound(writer, request)
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	for _, model := range []string{"openai-chat", "anthropic-chat"} {
+		t.Run(model, func(t *testing.T) {
+			body := `{"model":"` + model + `","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":12,"stream":true}`
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			request.Header.Set("Authorization", "Bearer client-key")
+			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
 
-			result := response.Result()
-			if result.StatusCode != http.StatusOK {
-				t.Fatalf("response = %d %s", result.StatusCode, response.Body.String())
+			if response.Code != http.StatusOK {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
 			}
-			if result.Header.Get("Content-Type") != "text/event-stream" || !response.Flushed {
-				t.Fatalf("headers = %#v, flushed = %v", result.Header, response.Flushed)
+			if response.Header().Get("Content-Type") != "text/event-stream" || !response.Flushed {
+				t.Fatalf("headers = %#v, flushed = %t", response.Header(), response.Flushed)
 			}
-			if !strings.Contains(response.Body.String(), `"content":"hello"`) || !strings.HasSuffix(response.Body.String(), "data: [DONE]\n\n") {
-				t.Fatalf("stream = %s", response.Body.String())
+			output := response.Body.String()
+			if !strings.Contains(output, `"object":"chat.completion.chunk"`) || !strings.Contains(output, `"content":"hello"`) {
+				t.Fatalf("stream = %s", output)
 			}
-			assertDiagnosticsTrailer(t, result.Trailer)
+			if !strings.HasSuffix(output, "data: [DONE]\n\n") {
+				t.Fatalf("stream has no completion marker: %s", output)
+			}
 		})
 	}
 }
 
-func TestRouterStreamsBeforeRequestEOFOverHTTP1(t *testing.T) {
-	router := newTestRouter(t, newTestTransformer(t, nil), Limits{MaxBodyBytes: testBodyLimit, MaxStreamBytes: testBodyLimit})
-	server := httptest.NewServer(router)
-	defer server.Close()
+func TestRouterFlushesBeforeUpstreamCompletes(t *testing.T) {
+	firstFrameSent := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	firstProviderFrame := responsesFrame("response.created", `{"type":"response.created","response":{"id":"resp_1","created_at":123,"model":"gpt-test","status":"in_progress","output":[]}}`)
+	remainingProviderFrames := strings.TrimPrefix(responsesTextStream(), firstProviderFrame)
+	released := false
+	defer func() {
+		if !released {
+			close(releaseUpstream)
+		}
+	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	bodyReader, bodyWriter := io.Pipe()
-	defer bodyReader.Close()
-	defer bodyWriter.Close()
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, firstProviderFrame)
+		writer.(http.Flusher).Flush()
+		close(firstFrameSent)
+		<-releaseUpstream
+		_, _ = io.WriteString(writer, remainingProviderFrames)
+	}))
+	defer provider.Close()
 
-	request, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		server.URL+"/v1/transform/openai-responses/sse/to/chat-completions",
-		bodyReader,
-	)
+	gateway := httptest.NewServer(newTestRouter(t, provider.URL, testBodyLimit))
+	defer gateway.Close()
+	request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}],"stream":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.Header.Set("Authorization", "Bearer client-key")
+
 	type responseResult struct {
 		response *http.Response
 		err      error
 	}
-	responseResults := make(chan responseResult, 1)
+	results := make(chan responseResult, 1)
 	go func() {
-		response, requestErr := server.Client().Do(request)
-		responseResults <- responseResult{response: response, err: requestErr}
+		response, requestErr := gateway.Client().Do(request)
+		results <- responseResult{response: response, err: requestErr}
 	}()
 
-	stream := responsesTextStream()
-	firstFrameEnd := strings.Index(stream, "\n\n") + 2
-	if firstFrameEnd < 2 {
-		t.Fatal("test stream has no complete first frame")
-	}
-	if _, err := bodyWriter.Write([]byte(stream[:firstFrameEnd])); err != nil {
-		t.Fatal(err)
+	select {
+	case <-firstFrameSent:
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not send its first frame")
 	}
 
 	var response *http.Response
 	select {
-	case result := <-responseResults:
+	case result := <-results:
 		if result.err != nil {
 			t.Fatal(result.err)
 		}
 		response = result.response
-	case <-ctx.Done():
-		t.Fatal("response headers were not flushed before request EOF")
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not flush before upstream completion")
 	}
 	defer response.Body.Close()
-	if response.ProtoMajor != 1 || response.StatusCode != http.StatusOK {
-		t.Fatalf("response = %s %d", response.Proto, response.StatusCode)
-	}
-	if response.Header.Get("Content-Type") != "text/event-stream" {
-		t.Fatalf("Content-Type = %q", response.Header.Get("Content-Type"))
-	}
 
-	responseReader := bufio.NewReader(response.Body)
-	firstLine, err := responseReader.ReadString('\n')
+	reader := bufio.NewReader(response.Body)
+	firstLine, err := reader.ReadString('\n')
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(firstLine, "data: ") {
-		t.Fatalf("first streamed line = %q", firstLine)
+	if !strings.HasPrefix(firstLine, "data: ") || !strings.Contains(firstLine, `"role":"assistant"`) {
+		t.Fatalf("first line = %q", firstLine)
 	}
 
-	if _, err := bodyWriter.Write([]byte(stream[firstFrameEnd:])); err != nil {
-		t.Fatal(err)
-	}
-	if err := bodyWriter.Close(); err != nil {
-		t.Fatal(err)
-	}
-	remaining, err := io.ReadAll(responseReader)
+	close(releaseUpstream)
+	released = true
+	remaining, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	output := firstLine + string(remaining)
-	if !strings.Contains(output, `"content":"hello"`) || !strings.HasSuffix(output, "data: [DONE]\n\n") {
-		t.Fatalf("stream = %s", output)
-	}
-	assertDiagnosticsTrailer(t, response.Trailer)
-}
-
-func TestRouterMovesStreamErrorsAfterFirstFrameToTrailer(t *testing.T) {
-	router := newTestRouter(t, newTestTransformer(t, nil), Limits{MaxBodyBytes: testBodyLimit, MaxStreamBytes: testBodyLimit})
-	body := responsesFrame("response.created", `{"type":"response.created","response":{"id":"resp_1","created_at":1,"model":"gpt-test","status":"in_progress","output":[]}}`) +
-		responsesFrame("response.output_text.delta", `{"type":"response.output_text.delta","output_index":"invalid","content_index":0,"delta":"x"}`)
-	request := httptest.NewRequest(http.MethodPost, "/v1/transform/openai-responses/sse/to/chat-completions", io.NopCloser(&oneByteReader{value: []byte(body)}))
-	response := newFullDuplexRecorder()
-
-	router.ServeHTTP(response, request)
-
-	result := response.Result()
-	if result.StatusCode != http.StatusOK || response.Body.Len() == 0 {
-		t.Fatalf("response = %d %s", result.StatusCode, response.Body.String())
-	}
-	diagnostics := assertDiagnosticsTrailer(t, result.Trailer)
-	if len(diagnostics) == 0 || diagnostics[len(diagnostics)-1].Severity != transformer.SeverityError {
-		t.Fatalf("diagnostics = %#v", diagnostics)
+	if !strings.Contains(string(remaining), `"content":"hello"`) || !strings.HasSuffix(string(remaining), "data: [DONE]\n\n") {
+		t.Fatalf("remaining stream = %s", remaining)
 	}
 }
 
-func TestRouterPropagatesCancellationToResolver(t *testing.T) {
-	resolver := &cancelResolver{started: make(chan struct{}), canceled: make(chan struct{})}
-	router := newTestRouter(t, newTestTransformer(t, resolver), Limits{MaxBodyBytes: testBodyLimit, MaxStreamBytes: testBodyLimit})
+func TestRouterCancelsUpstreamWhenClientCancels(t *testing.T) {
+	upstreamStarted := make(chan struct{})
+	upstreamCanceled := make(chan struct{})
+	doer := httpDoerFunc(func(request *http.Request) (*http.Response, error) {
+		close(upstreamStarted)
+		<-request.Context().Done()
+		close(upstreamCanceled)
+		return nil, request.Context().Err()
+	})
+	router := newTestRouterWithDoer(t, "https://provider.example", testBodyLimit, doer)
 	ctx, cancel := context.WithCancel(context.Background())
-	request := httptest.NewRequest(http.MethodPost, "/v1/transform/chat-completions/to/openai-responses", strings.NewReader(`{
-		"model":"general",
-		"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}]
-	}`)).WithContext(ctx)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}]}`)).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer client-key")
 	done := make(chan struct{})
 	go func() {
-		router.ServeHTTP(newFullDuplexRecorder(), request)
+		router.ServeHTTP(httptest.NewRecorder(), request)
 		close(done)
 	}()
 
-	waitForSignal(t, resolver.started, "resolver did not start")
+	select {
+	case <-upstreamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request did not start")
+	}
 	cancel()
-	waitForSignal(t, done, "handler did not return after cancellation")
-	waitForSignal(t, resolver.canceled, "resolver did not observe request cancellation")
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request was not canceled")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("gateway handler did not stop after cancellation")
+	}
 }
 
-func TestRouterCancellationUnblocksStreamRead(t *testing.T) {
+func TestRouterCancelsBlockedRequestBodyRead(t *testing.T) {
 	body := newBlockingBody()
-	router := newTestRouter(t, newTestTransformer(t, nil), Limits{MaxBodyBytes: testBodyLimit, MaxStreamBytes: testBodyLimit})
+	router := newTestRouter(t, "https://provider.example", testBodyLimit)
 	ctx, cancel := context.WithCancel(context.Background())
-	request := httptest.NewRequest(http.MethodPost, "/v1/transform/openai-responses/sse/to/chat-completions", body).WithContext(ctx)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	request.Body = body
+	request.ContentLength = -1
+	request.Header.Set("Authorization", "Bearer client-key")
 	done := make(chan struct{})
 	go func() {
-		router.ServeHTTP(newFullDuplexRecorder(), request)
+		router.ServeHTTP(httptest.NewRecorder(), request)
 		close(done)
 	}()
 
 	waitForSignal(t, body.started, "request body read did not start")
 	cancel()
-	waitForSignal(t, body.closed, "request body was not closed on cancellation")
-	waitForSignal(t, done, "handler did not return after cancellation")
+	waitForSignal(t, body.closed, "request body was not closed after cancellation")
+	waitForSignal(t, done, "gateway handler did not stop after request cancellation")
 }
 
-func newTestRouter(t *testing.T, service *transformer.Transformer, limits Limits) http.Handler {
+func TestRouterCancelsBlockedUpstreamStreamRead(t *testing.T) {
+	body := newBlockingBody()
+	doer := httpDoerFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       body,
+		}, nil
+	})
+	router := newTestRouterWithDoer(t, "https://provider.example", testBodyLimit, doer)
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}],"stream":true}`)).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer client-key")
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(httptest.NewRecorder(), request)
+		close(done)
+	}()
+
+	waitForSignal(t, body.started, "upstream stream body read did not start")
+	cancel()
+	waitForSignal(t, body.closed, "upstream stream body was not closed after cancellation")
+	waitForSignal(t, done, "gateway handler did not stop after stream cancellation")
+}
+
+func TestRouterEmitsStreamErrorAfterOutputStarts(t *testing.T) {
+	doer := httpDoerFunc(func(_ *http.Request) (*http.Response, error) {
+		body := &chunkReadCloser{chunks: [][]byte{
+			[]byte(responsesFrame("response.created", `{"type":"response.created","response":{"id":"resp_1","created_at":123,"model":"gpt-test","status":"in_progress","output":[]}}`)),
+			[]byte(responsesFrame("response.output_text.delta", `{"type":"response.output_text.delta","output_index":"invalid","content_index":0,"delta":"x"}`)),
+		}}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       body,
+		}, nil
+	})
+	router := newTestRouterWithDoer(t, "https://provider.example", testBodyLimit, doer)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}],"stream":true}`))
+	request.Header.Set("Authorization", "Bearer client-key")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	output := response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(output, `"role":"assistant"`) {
+		t.Fatalf("partial stream = %d %s", response.Code, output)
+	}
+	if !strings.Contains(output, `"error":`) || !strings.Contains(output, "invalid_responses_stream_event") {
+		t.Fatalf("stream error frame is missing: %s", output)
+	}
+	if strings.Contains(output, "data: [DONE]") {
+		t.Fatalf("failed stream must not emit DONE: %s", output)
+	}
+}
+
+func TestRouterRejectsNonTerminalStreamFinish(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, strings.Replace(anthropicTextStream(), `"end_turn"`, `"pause_turn"`, 1))
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"anthropic-chat","messages":[{"role":"user","content":"hello"}],"stream":true}`))
+	request.Header.Set("Authorization", "Bearer client-key")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	output := response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(output, "upstream_response_not_terminal") {
+		t.Fatalf("response = %d %s", response.Code, output)
+	}
+	if strings.Contains(output, "data: [DONE]") {
+		t.Fatalf("non-terminal stream must not emit DONE: %s", output)
+	}
+}
+
+func TestRouterStopsReadingAfterTerminalStreamEvent(t *testing.T) {
+	body := &chunkReadCloser{chunks: [][]byte{
+		[]byte(responsesTextStream()),
+		[]byte(responsesFrame("error", `{"type":"error","code":"late_error","message":"must be ignored"}`)),
+	}}
+	doer := httpDoerFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       body,
+		}, nil
+	})
+	router := newTestRouterWithDoer(t, "https://provider.example", testBodyLimit, doer)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}],"stream":true}`))
+	request.Header.Set("Authorization", "Bearer client-key")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	output := response.Body.String()
+	if !strings.HasSuffix(output, "data: [DONE]\n\n") || strings.Contains(output, `"error":`) {
+		t.Fatalf("terminal stream output = %s", output)
+	}
+	if len(body.chunks) != 1 {
+		t.Fatalf("gateway read %d post-terminal chunks, want 0", 1-len(body.chunks))
+	}
+}
+
+func TestRouterRespectsStreamUsageOption(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, anthropicTextStream())
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	tests := []struct {
+		name        string
+		streamExtra string
+		wantUsage   bool
+	}{
+		{name: "default", wantUsage: false},
+		{name: "included", streamExtra: `,"stream_options":{"include_usage":true}`, wantUsage: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := `{"model":"anthropic-chat","messages":[{"role":"user","content":"hello"}],"stream":true` + test.streamExtra + `}`
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			request.Header.Set("Authorization", "Bearer client-key")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusOK {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+			hasUsage := strings.Contains(response.Body.String(), `"usage":`)
+			if hasUsage != test.wantUsage {
+				t.Fatalf("usage present = %t, want %t in %s", hasUsage, test.wantUsage, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestRouterNormalizesUpstreamError(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Header().Set("Retry-After", "2")
+		writer.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(writer, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"},"request_id":"req_1"}`)
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"anthropic-chat","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":12}`))
+	request.Header.Set("Authorization", "Bearer client-key")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") != "2" {
+		t.Fatalf("response = %d headers=%#v", response.Code, response.Header())
+	}
+	var result apiErrorResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Error.Message != "slow down" || result.Error.Type != "rate_limit_error" || result.Error.Code != "rate_limit_error" {
+		t.Fatalf("error = %#v", result.Error)
+	}
+}
+
+func TestParseUpstreamErrorKeepsOpenAIFieldTypes(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		wantCode  any
+		wantParam any
+	}{
+		{name: "explicit nulls", body: `{"error":{"message":"bad","type":"invalid_request_error","param":null,"code":null}}`, wantCode: nil, wantParam: nil},
+		{name: "missing code falls back to type", body: `{"error":{"message":"bad","type":"invalid_request_error"}}`, wantCode: "invalid_request_error", wantParam: nil},
+		{name: "invalid shapes are normalized", body: `{"error":{"message":"bad","type":"invalid_request_error","param":{},"code":[]}}`, wantCode: "upstream_error", wantParam: nil},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := parseUpstreamError(http.StatusBadRequest, []byte(test.body))
+			if got.Code != test.wantCode || got.Param != test.wantParam {
+				t.Fatalf("error = %#v, want code %#v param %#v", got, test.wantCode, test.wantParam)
+			}
+		})
+	}
+}
+
+func TestRouterRequiresBearerAuthentication(t *testing.T) {
+	var calls atomic.Int64
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writer.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	for _, authorization := range []string{"", "Basic secret", "Bearer", "Bearer one two"} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}]}`))
+		request.Header.Set("Authorization", authorization)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), "invalid_api_key") {
+			t.Fatalf("Authorization %q response = %d %s", authorization, response.Code, response.Body.String())
+		}
+	}
+
+	duplicateRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}]}`))
+	duplicateRequest.Header.Add("Authorization", "Bearer first-key")
+	duplicateRequest.Header.Add("Authorization", "Bearer second-key")
+	duplicateResponse := httptest.NewRecorder()
+	router.ServeHTTP(duplicateResponse, duplicateRequest)
+	if duplicateResponse.Code != http.StatusUnauthorized || !strings.Contains(duplicateResponse.Body.String(), "invalid_api_key") {
+		t.Fatalf("duplicate Authorization response = %d %s", duplicateResponse.Code, duplicateResponse.Body.String())
+	}
+
+	if calls.Load() != 0 {
+		t.Fatalf("upstream calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestRouterRejectsInvalidAndUnknownRequestsBeforeUpstream(t *testing.T) {
+	var calls atomic.Int64
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writer.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "invalid JSON", body: `{`, wantStatus: http.StatusBadRequest, wantCode: "invalid_json"},
+		{name: "unknown model", body: `{"model":"missing","messages":[{"role":"user","content":"hello"}]}`, wantStatus: http.StatusNotFound, wantCode: "model_not_found"},
+		{name: "multiple candidates", body: `{"model":"openai-chat","messages":[{"role":"user","content":"hello"}],"n":2}`, wantStatus: http.StatusBadRequest, wantCode: "candidate_count_unsupported"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(test.body))
+			request.Header.Set("Authorization", "Bearer client-key")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != test.wantStatus || !strings.Contains(response.Body.String(), test.wantCode) {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("upstream calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestRouterRejectsOversizedRequestAndInvalidUpstream(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{not-json`)
+	}))
+	defer provider.Close()
+
+	t.Run("request", func(t *testing.T) {
+		router := newTestRouter(t, provider.URL, 8)
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"more":"than eight bytes"}`))
+		request.Header.Set("Authorization", "Bearer client-key")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusRequestEntityTooLarge || !strings.Contains(response.Body.String(), "request_too_large") {
+			t.Fatalf("response = %d %s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("upstream", func(t *testing.T) {
+		router := newTestRouter(t, provider.URL, testBodyLimit)
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}]}`))
+		request.Header.Set("Authorization", "Bearer client-key")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "invalid_responses_response") {
+			t.Fatalf("response = %d %s", response.Code, response.Body.String())
+		}
+	})
+}
+
+func TestRouterLimitsUpstreamResponses(t *testing.T) {
+	t.Run("buffered", func(t *testing.T) {
+		doer := httpDoerFunc(func(_ *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader("123456789")),
+			}, nil
+		})
+		router := newTestRouterWithLimits(t, "https://provider.example", testBodyLimit, 8, doer)
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}]}`))
+		request.Header.Set("Authorization", "Bearer client-key")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "upstream_response_too_large") {
+			t.Fatalf("response = %d %s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("streaming after first frame", func(t *testing.T) {
+		firstFrame := responsesFrame("response.created", `{"type":"response.created","response":{"id":"resp_1","created_at":123,"model":"gpt-test","status":"in_progress","output":[]}}`)
+		doer := httpDoerFunc(func(_ *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       &chunkReadCloser{chunks: [][]byte{[]byte(firstFrame), []byte("too large")}},
+			}, nil
+		})
+		router := newTestRouterWithLimits(t, "https://provider.example", testBodyLimit, int64(len(firstFrame)+1), doer)
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}],"stream":true}`))
+		request.Header.Set("Authorization", "Bearer client-key")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		output := response.Body.String()
+		if response.Code != http.StatusOK || !strings.Contains(output, `"role":"assistant"`) || !strings.Contains(output, "upstream_response_too_large") {
+			t.Fatalf("response = %d %s", response.Code, output)
+		}
+		if strings.Contains(output, "data: [DONE]") {
+			t.Fatalf("oversized stream must not emit DONE: %s", output)
+		}
+	})
+}
+
+func TestRouterRejectsNonEventStreamResponse(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, responsesResponse())
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}],"stream":true}`))
+	request.Header.Set("Authorization", "Bearer client-key")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "upstream_invalid_content_type") {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestRouterRejectsNonJSONBufferedResponse(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(writer, responsesResponse())
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Authorization", "Bearer client-key")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "upstream_invalid_content_type") {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestRouterTimesOutBufferedUpstreamBody(t *testing.T) {
+	body := newBlockingBody()
+	doer := httpDoerFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       body,
+		}, nil
+	})
+	router := newTestRouterWithResponseTimeout(t, "https://provider.example", testBodyLimit, 20*time.Millisecond, doer)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Authorization", "Bearer client-key")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusGatewayTimeout || !strings.Contains(response.Body.String(), "upstream_response_timeout") {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	waitForSignal(t, body.started, "upstream body read did not start")
+	waitForSignal(t, body.closed, "upstream body was not closed after timeout")
+}
+
+func TestRouterDoesNotFollowUpstreamRedirects(t *testing.T) {
+	var redirected atomic.Int64
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/redirected" {
+			redirected.Add(1)
+			writer.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Redirect(writer, request, "/redirected", http.StatusTemporaryRedirect)
+	}))
+	defer provider.Close()
+	router := newTestRouter(t, provider.URL, testBodyLimit)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai-chat","messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Authorization", "Bearer client-key")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "upstream_invalid_status") {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	if redirected.Load() != 0 {
+		t.Fatalf("redirect target calls = %d, want 0", redirected.Load())
+	}
+}
+
+func TestDiagnosticsHeaderIsBoundedAndDoesNotExposeSourceValues(t *testing.T) {
+	diagnostics := make([]transformer.Diagnostic, 0, 20)
+	path := strings.Repeat("😀<&", 100)
+	for index := 0; index < 20; index++ {
+		diagnostics = append(diagnostics, transformer.Diagnostic{
+			Severity:    transformer.SeverityWarning,
+			Code:        transformer.DiagnosticCode("warning"),
+			Message:     strings.Repeat("😀<&", 100),
+			Path:        &path,
+			SourceValue: json.RawMessage(`{"secret":"must-not-leak"}`),
+		})
+	}
+	diagnostics = append(diagnostics, transformer.Diagnostic{
+		Severity: transformer.SeverityError,
+		Code:     transformer.DiagnosticCode("final_error"),
+		Message:  "final error",
+	})
+
+	header := make(http.Header)
+	setDiagnosticsHeader(header, diagnostics)
+	encoded := header.Get(diagnosticsTrailer)
+	if encoded == "" || len(encoded) > maxDiagnosticsHeader {
+		t.Fatalf("diagnostics header length = %d", len(encoded))
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var publicDiagnostics []transformer.Diagnostic
+	if err := json.Unmarshal(raw, &publicDiagnostics); err != nil {
+		t.Fatal(err)
+	}
+	if len(publicDiagnostics) > maxGatewayDiagnostics {
+		t.Fatalf("diagnostics count = %d", len(publicDiagnostics))
+	}
+	foundError := false
+	for _, diagnostic := range publicDiagnostics {
+		if len(diagnostic.SourceValue) != 0 {
+			t.Fatalf("source value leaked: %s", diagnostic.SourceValue)
+		}
+		if diagnostic.Code == "final_error" {
+			foundError = true
+		}
+	}
+	if !foundError {
+		t.Fatalf("bounded diagnostics dropped the error: %#v", publicDiagnostics)
+	}
+}
+
+func newTestRouter(t *testing.T, providerURL string, limit int64) http.Handler {
+	return newTestRouterWithLimits(t, providerURL, limit, testBodyLimit, nil)
+}
+
+func newTestRouterWithDoer(t *testing.T, providerURL string, limit int64, doer upstream.HTTPDoer) http.Handler {
+	return newTestRouterWithLimits(t, providerURL, limit, testBodyLimit, doer)
+}
+
+func newTestRouterWithLimits(t *testing.T, providerURL string, bodyLimit, responseLimit int64, doer upstream.HTTPDoer) http.Handler {
+	return newTestRouterWithConfiguredLimits(t, providerURL, Limits{MaxBodyBytes: bodyLimit, MaxStreamBytes: responseLimit}, doer)
+}
+
+func newTestRouterWithResponseTimeout(t *testing.T, providerURL string, limit int64, timeout time.Duration, doer upstream.HTTPDoer) http.Handler {
+	return newTestRouterWithConfiguredLimits(t, providerURL, Limits{MaxBodyBytes: limit, MaxStreamBytes: testBodyLimit, ResponseBodyTimeout: timeout}, doer)
+}
+
+func newTestRouterWithConfiguredLimits(t *testing.T, providerURL string, limits Limits, doer upstream.HTTPDoer) http.Handler {
 	t.Helper()
-	router, err := NewRouter(service, limits)
+	service := newTestTransformer(t)
+	client, err := upstream.New(upstream.Settings{
+		ResponseHeaderTimeout: time.Second,
+		Upstreams: map[string]upstream.Config{
+			"openai": {
+				Endpoint: capabilities.EndpointResponses,
+				URL:      providerURL + "/v1/responses",
+			},
+			"anthropic": {
+				Endpoint: capabilities.EndpointMessages,
+				URL:      providerURL + "/v1/messages",
+			},
+		},
+		Routes: map[string]string{
+			"openai-chat":    "openai",
+			"anthropic-chat": "anthropic",
+		},
+	}, doer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := NewRouter(service, client, limits)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return router
 }
 
-func newTestTransformer(t *testing.T, resolver transformer.AssetResolver) *transformer.Transformer {
+type httpDoerFunc func(*http.Request) (*http.Response, error)
+
+func (function httpDoerFunc) Do(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
+
+type chunkReadCloser struct {
+	chunks [][]byte
+}
+
+func (body *chunkReadCloser) Read(target []byte) (int, error) {
+	if len(body.chunks) == 0 {
+		return 0, io.EOF
+	}
+	chunk := body.chunks[0]
+	body.chunks = body.chunks[1:]
+	return copy(target, chunk), nil
+}
+
+func (*chunkReadCloser) Close() error {
+	return nil
+}
+
+type blockingBody struct {
+	started   chan struct{}
+	closed    chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
+}
+
+func newBlockingBody() *blockingBody {
+	return &blockingBody{started: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (body *blockingBody) Read([]byte) (int, error) {
+	body.startOnce.Do(func() { close(body.started) })
+	<-body.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (body *blockingBody) Close() error {
+	body.closeOnce.Do(func() { close(body.closed) })
+	return nil
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, failure string) {
 	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatal(failure)
+	}
+}
+
+func newTestTransformer(t *testing.T) *transformer.Transformer {
+	t.Helper()
+	defaultMaxTokens := 1024
 	service, err := transformer.New(transformer.Config{
-		Resolver: resolver,
+		DefaultMaxOutputTokens: &defaultMaxTokens,
 		Profiles: []transformer.CapabilityProfile{
 			{
 				Provider: transformer.ProviderOpenAI,
 				Endpoint: transformer.EndpointResponses,
 				Model:    "openai-target",
-				Images:   transformer.ImageCapabilities{URL: true},
-				Content:  transformer.ContentCapabilities{Text: true, Image: true},
+				Content:  transformer.ContentCapabilities{Text: true},
 			},
 			{
 				Provider: transformer.ProviderAnthropic,
 				Endpoint: transformer.EndpointMessages,
 				Model:    "anthropic-target",
-				Images:   transformer.ImageCapabilities{URL: true},
-				Content:  transformer.ContentCapabilities{Text: true, Image: true},
+				Content:  transformer.ContentCapabilities{Text: true},
 			},
 		},
-		Routes: []transformer.ModelRoute{{
-			Alias: "general",
-			Targets: map[transformer.Endpoint]string{
-				transformer.EndpointResponses: "openai-target",
-				transformer.EndpointMessages:  "anthropic-target",
-			},
-		}},
+		Routes: []transformer.ModelRoute{
+			{Alias: "openai-chat", Targets: map[transformer.Endpoint]string{transformer.EndpointResponses: "openai-target"}},
+			{Alias: "anthropic-chat", Targets: map[transformer.Endpoint]string{transformer.EndpointMessages: "anthropic-target"}},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -350,35 +964,12 @@ func newTestTransformer(t *testing.T, resolver transformer.AssetResolver) *trans
 	return service
 }
 
-func assertJSONField(t *testing.T, raw json.RawMessage, key, want string) {
-	t.Helper()
-	var object map[string]any
-	if err := json.Unmarshal(raw, &object); err != nil {
-		t.Fatal(err)
-	}
-	if object[key] != want {
-		t.Fatalf("%s = %#v, want %q in %s", key, object[key], want, raw)
-	}
+func responsesResponse() string {
+	return `{"id":"resp_1","created_at":123,"model":"gpt-test","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]}]}]}`
 }
 
-func assertDiagnosticsTrailer(t *testing.T, trailer http.Header) []transformer.Diagnostic {
-	t.Helper()
-	value := trailer.Get(diagnosticsTrailer)
-	if value == "" {
-		t.Fatal("diagnostics trailer is missing")
-	}
-	decoded, err := base64.RawURLEncoding.DecodeString(value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var diagnostics []transformer.Diagnostic
-	if err := json.Unmarshal(decoded, &diagnostics); err != nil {
-		t.Fatal(err)
-	}
-	if diagnostics == nil {
-		t.Fatal("diagnostics trailer must contain a JSON array")
-	}
-	return diagnostics
+func anthropicResponse() string {
+	return `{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}`
 }
 
 func responsesTextStream() string {
@@ -414,76 +1005,4 @@ func anthropicTextStream() string {
 		result.WriteString("\n\n")
 	}
 	return result.String()
-}
-
-type fullDuplexRecorder struct {
-	*httptest.ResponseRecorder
-}
-
-func newFullDuplexRecorder() *fullDuplexRecorder {
-	return &fullDuplexRecorder{ResponseRecorder: httptest.NewRecorder()}
-}
-
-func (*fullDuplexRecorder) EnableFullDuplex() error {
-	return nil
-}
-
-type oneByteReader struct {
-	value []byte
-}
-
-func (r *oneByteReader) Read(target []byte) (int, error) {
-	if len(r.value) == 0 {
-		return 0, io.EOF
-	}
-	target[0] = r.value[0]
-	r.value = r.value[1:]
-	return 1, nil
-}
-
-type cancelResolver struct {
-	started  chan struct{}
-	canceled chan struct{}
-}
-
-func (r *cancelResolver) ResolveForResponses(ctx context.Context, _ transformer.AssetSource) (transformer.ResolvedAsset, error) {
-	close(r.started)
-	<-ctx.Done()
-	close(r.canceled)
-	return transformer.ResolvedAsset{}, ctx.Err()
-}
-
-func (r *cancelResolver) ResolveForAnthropic(ctx context.Context, source transformer.AssetSource) (transformer.ResolvedAsset, error) {
-	return r.ResolveForResponses(ctx, source)
-}
-
-type blockingBody struct {
-	started   chan struct{}
-	closed    chan struct{}
-	startOnce sync.Once
-	closeOnce sync.Once
-}
-
-func newBlockingBody() *blockingBody {
-	return &blockingBody{started: make(chan struct{}), closed: make(chan struct{})}
-}
-
-func (b *blockingBody) Read([]byte) (int, error) {
-	b.startOnce.Do(func() { close(b.started) })
-	<-b.closed
-	return 0, io.ErrClosedPipe
-}
-
-func (b *blockingBody) Close() error {
-	b.closeOnce.Do(func() { close(b.closed) })
-	return nil
-}
-
-func waitForSignal(t *testing.T, signal <-chan struct{}, failure string) {
-	t.Helper()
-	select {
-	case <-signal:
-	case <-time.After(time.Second):
-		t.Fatal(failure)
-	}
 }

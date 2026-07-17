@@ -165,6 +165,8 @@ func encodeFinishReason(output canonical.Output, mode canonical.Mode) (string, [
 		reason = "length"
 	case canonical.FinishReasonToolCalls:
 		reason = "tool_calls"
+	case canonical.FinishReasonContentFilter:
+		reason = "content_filter"
 	case canonical.FinishReasonRefusal:
 		reason = "stop"
 		diagnostics = append(diagnostics, lossyDiagnostic(mode, diagnosticFinishReasonLossy, "Chat Completions has no refusal finish reason; refusal content is preserved and finish_reason is stop", fmt.Sprintf("outputs.%d.finish_reason", output.Index), nil))

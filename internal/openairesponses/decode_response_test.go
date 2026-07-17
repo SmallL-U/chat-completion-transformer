@@ -103,7 +103,7 @@ func TestDecodeResponseMapsStatuses(t *testing.T) {
 	}{
 		{name: "completed", status: "completed", wantReason: canonical.FinishReasonStop},
 		{name: "max output incomplete", status: "incomplete", extra: `,"incomplete_details":{"reason":"max_output_tokens"}`, wantReason: canonical.FinishReasonLength, wantProvider: "max_output_tokens"},
-		{name: "other incomplete", status: "incomplete", extra: `,"incomplete_details":{"reason":"content_filter"}`, wantReason: canonical.FinishReasonUnknown, wantProvider: "content_filter"},
+		{name: "content filter incomplete", status: "incomplete", extra: `,"incomplete_details":{"reason":"content_filter"}`, wantReason: canonical.FinishReasonContentFilter, wantProvider: "content_filter"},
 		{name: "failed", status: "failed", extra: `,"error":{"code":"server_error","message":"failed"}`, wantReason: canonical.FinishReasonError, wantProvider: "failed"},
 		{name: "queued", status: "queued", wantReason: canonical.FinishReasonUnknown, wantProvider: "queued"},
 	} {

@@ -11,6 +11,7 @@ type StreamEncoderOptions struct {
 	Created       int64
 	FallbackID    string
 	FallbackModel string
+	IncludeUsage  bool
 }
 
 type ResponsesStreamDecoder struct {
@@ -76,6 +77,7 @@ func (t *Transformer) CreateChatStreamEncoder(options StreamEncoderOptions) *Cha
 		Created:       options.Created,
 		FallbackID:    options.FallbackID,
 		FallbackModel: options.FallbackModel,
+		IncludeUsage:  options.IncludeUsage,
 	})}
 }
 

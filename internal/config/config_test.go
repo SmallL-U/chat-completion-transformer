@@ -19,6 +19,14 @@ const validYAML = `server:
   max_body_bytes: 2000000
   max_stream_bytes: 64000000
   max_sse_event_bytes: 4000000
+gateway:
+  response_header_timeout: "45s"
+  upstreams:
+    openai-main:
+      endpoint: "responses"
+      url: "https://api.openai.com/v1/responses"
+  routes:
+    general: "openai-main"
 transformer:
   mode: "compatible"
   instruction_policy: "preserve_messages"
@@ -70,6 +78,12 @@ func TestLoadYAML(t *testing.T) {
 	if config.Server.MaxStreamBytes != 64_000_000 {
 		t.Fatalf("MaxStreamBytes = %d, want 64000000", config.Server.MaxStreamBytes)
 	}
+	if config.Gateway.ResponseHeaderTimeout != 45*time.Second {
+		t.Fatalf("ResponseHeaderTimeout = %v, want 45s", config.Gateway.ResponseHeaderTimeout)
+	}
+	if config.Gateway.Routes["general"] != "openai-main" {
+		t.Fatalf("Gateway routes = %+v, want general route", config.Gateway.Routes)
+	}
 	if config.Transformer.DefaultMaxOutputTokens == nil || *config.Transformer.DefaultMaxOutputTokens != 2048 {
 		t.Fatalf("DefaultMaxOutputTokens = %v, want 2048", config.Transformer.DefaultMaxOutputTokens)
 	}
@@ -107,6 +121,7 @@ func TestLoadScalarEnvironmentOverrides(t *testing.T) {
 	t.Setenv("CCT_SERVER_MAX_BODY_BYTES", "3000000")
 	t.Setenv("CCT_SERVER_MAX_STREAM_BYTES", "90000000")
 	t.Setenv("CCT_SERVER_MAX_SSE_EVENT_BYTES", "5000000")
+	t.Setenv("CCT_GATEWAY_RESPONSE_HEADER_TIMEOUT", "90s")
 	t.Setenv("CCT_TRANSFORMER_MODE", "strict")
 	t.Setenv("CCT_TRANSFORMER_INSTRUCTION_POLICY", "extract_leading")
 	t.Setenv("CCT_TRANSFORMER_ANTHROPIC_ENDPOINT", "vertex-messages")
@@ -125,6 +140,9 @@ func TestLoadScalarEnvironmentOverrides(t *testing.T) {
 	}
 	if config.Server.MaxBodyBytes != 3_000_000 || config.Server.MaxStreamBytes != 90_000_000 || config.Server.MaxSSEEventBytes != 5_000_000 {
 		t.Fatalf("server size overrides were not applied: %+v", config.Server)
+	}
+	if config.Gateway.ResponseHeaderTimeout != 90*time.Second {
+		t.Fatalf("gateway duration override was not applied: %+v", config.Gateway)
 	}
 	if config.Transformer.Mode != "strict" || config.Transformer.InstructionPolicy != "extract_leading" || config.Transformer.AnthropicEndpoint != capabilities.EndpointVertexMessages {
 		t.Fatalf("transformer scalar overrides were not applied: %+v", config.Transformer)
@@ -160,6 +178,8 @@ func TestLoadNullableDefaultMaxOutputTokensEnvironmentOverrides(t *testing.T) {
 
 func TestLoadComplexEnvironmentOverrides(t *testing.T) {
 	clearConfigEnvironment(t)
+	t.Setenv("CCT_GATEWAY_UPSTREAMS", `{"anthropic-main":{"endpoint":"messages","url":"https://api.anthropic.com/v1/messages","anthropic_version":"2023-06-01"}}`)
+	t.Setenv("CCT_GATEWAY_ROUTES", `{"environment":"anthropic-main"}`)
 	t.Setenv("CCT_TRANSFORMER_PROFILES", `[{"provider":"anthropic","endpoint":"messages","model":"claude-env","content":{"text":true}}]`)
 	t.Setenv("CCT_TRANSFORMER_ROUTES", `[{"alias":"environment","targets":{"messages":"claude-env"}}]`)
 
@@ -174,9 +194,60 @@ func TestLoadComplexEnvironmentOverrides(t *testing.T) {
 	if len(config.Transformer.Routes) != 1 || config.Transformer.Routes[0].Alias != "environment" {
 		t.Fatalf("Routes = %+v, want JSON environment routes", config.Transformer.Routes)
 	}
+	if config.Gateway.Routes["environment"] != "anthropic-main" {
+		t.Fatalf("Gateway routes = %+v, want environment route", config.Gateway.Routes)
+	}
+}
+
+func TestLoadCollectionEnvironmentStates(t *testing.T) {
+	tests := []struct {
+		name             string
+		setEnvironment   bool
+		gatewayValue     string
+		transformerValue string
+		wantLength       int
+	}{
+		{name: "unset preserves YAML", wantLength: 1},
+		{name: "empty string clears", setEnvironment: true, wantLength: 0},
+		{name: "null clears", setEnvironment: true, gatewayValue: `null`, transformerValue: `null`, wantLength: 0},
+		{name: "empty JSON clears", setEnvironment: true, gatewayValue: `{}`, transformerValue: `[]`, wantLength: 0},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			if test.setEnvironment {
+				t.Setenv("CCT_GATEWAY_UPSTREAMS", test.gatewayValue)
+				t.Setenv("CCT_GATEWAY_ROUTES", test.gatewayValue)
+				t.Setenv("CCT_TRANSFORMER_PROFILES", test.transformerValue)
+				t.Setenv("CCT_TRANSFORMER_ROUTES", test.transformerValue)
+			}
+
+			config, err := Load(writeConfig(t, validYAML))
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if len(config.Gateway.Upstreams) != test.wantLength || len(config.Gateway.Routes) != test.wantLength {
+				t.Fatalf("gateway collection lengths = %d/%d, want %d: %+v", len(config.Gateway.Upstreams), len(config.Gateway.Routes), test.wantLength, config.Gateway)
+			}
+			if len(config.Transformer.Profiles) != test.wantLength || len(config.Transformer.Routes) != test.wantLength {
+				t.Fatalf("transformer collection lengths = %d/%d, want %d: %+v", len(config.Transformer.Profiles), len(config.Transformer.Routes), test.wantLength, config.Transformer)
+			}
+		})
+	}
 }
 
 func TestLoadRejectsInvalidConfiguration(t *testing.T) {
+	t.Run("explicit empty scalar environment", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		t.Setenv("CCT_SERVER_ADDRESS", "")
+
+		_, err := Load(writeConfig(t, validYAML))
+		if err == nil || !strings.Contains(err.Error(), "address is required") {
+			t.Fatalf("Load() error = %v, want explicit empty address error", err)
+		}
+	})
+
 	t.Run("invalid scalar environment", func(t *testing.T) {
 		clearConfigEnvironment(t)
 		t.Setenv("CCT_SERVER_MAX_BODY_BYTES", "not-a-number")
@@ -227,6 +298,48 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		}
 	})
 
+	t.Run("gateway route without transformer endpoint target", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		configYAML := strings.Replace(
+			validYAML,
+			`    - provider: "openai"
+      endpoint: "responses"`,
+			`    - provider: "anthropic"
+      endpoint: "messages"`,
+			1,
+		)
+		configYAML = strings.Replace(configYAML, `        responses: "gpt-test"`, `        messages: "gpt-test"`, 1)
+
+		_, err := Load(writeConfig(t, configYAML))
+		if err == nil || !strings.Contains(err.Error(), "has no responses target") {
+			t.Fatalf("Load() error = %v, want missing gateway endpoint target error", err)
+		}
+	})
+
+	t.Run("gateway route references unknown upstream", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		configYAML := strings.Replace(validYAML, `    general: "openai-main"`, `    general: "missing"`, 1)
+
+		_, err := Load(writeConfig(t, configYAML))
+		if err == nil || !strings.Contains(err.Error(), `references unknown upstream "missing"`) {
+			t.Fatalf("Load() error = %v, want unknown gateway upstream error", err)
+		}
+	})
+
+	t.Run("direct messages requires messages transformer endpoint", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		t.Setenv("CCT_GATEWAY_UPSTREAMS", `{"anthropic":{"endpoint":"messages","url":"https://api.anthropic.com/v1/messages"}}`)
+		t.Setenv("CCT_GATEWAY_ROUTES", `{"general":"anthropic"}`)
+		t.Setenv("CCT_TRANSFORMER_PROFILES", `[{"provider":"anthropic","endpoint":"messages","model":"claude-test","content":{"text":true}}]`)
+		t.Setenv("CCT_TRANSFORMER_ROUTES", `[{"alias":"general","targets":{"messages":"claude-test"}}]`)
+		t.Setenv("CCT_TRANSFORMER_ANTHROPIC_ENDPOINT", "vertex-messages")
+
+		_, err := Load(writeConfig(t, validYAML))
+		if err == nil || !strings.Contains(err.Error(), "uses direct messages") {
+			t.Fatalf("Load() error = %v, want direct Messages endpoint mismatch", err)
+		}
+	})
+
 	t.Run("zero default output tokens", func(t *testing.T) {
 		clearConfigEnvironment(t)
 		configYAML := strings.Replace(validYAML, "default_max_output_tokens: 2048", "default_max_output_tokens: 0", 1)
@@ -261,6 +374,9 @@ func clearConfigEnvironment(t *testing.T) {
 		"CCT_SERVER_MAX_BODY_BYTES",
 		"CCT_SERVER_MAX_STREAM_BYTES",
 		"CCT_SERVER_MAX_SSE_EVENT_BYTES",
+		"CCT_GATEWAY_RESPONSE_HEADER_TIMEOUT",
+		"CCT_GATEWAY_UPSTREAMS",
+		"CCT_GATEWAY_ROUTES",
 		"CCT_TRANSFORMER_MODE",
 		"CCT_TRANSFORMER_INSTRUCTION_POLICY",
 		"CCT_TRANSFORMER_ANTHROPIC_ENDPOINT",

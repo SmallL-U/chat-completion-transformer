@@ -20,6 +20,7 @@ type StreamEncodeOptions struct {
 	Created       int64
 	FallbackID    string
 	FallbackModel string
+	IncludeUsage  bool
 }
 
 // StreamEncoder converts one canonical event stream into Chat Completions SSE.
@@ -157,7 +158,9 @@ func (e *StreamEncoder) Encode(event canonical.Event) canonical.Result[[][]byte]
 		if canonical.HasErrors(diagnostics) {
 			break
 		}
-		e.pendingUsage = mergeUsage(e.pendingUsage, *event.Usage)
+		if e.options.IncludeUsage {
+			e.pendingUsage = mergeUsage(e.pendingUsage, *event.Usage)
+		}
 	case canonical.EventFinish:
 		if lenOpenTools(e.openTools) > 0 {
 			diagnostics = append(diagnostics, diagnostic(canonical.SeverityError, diagnosticStreamState, "stream finished before every tool call ended", "", nil))
@@ -240,7 +243,7 @@ func (e *StreamEncoder) chunkFrame(delta map[string]any, finishReason any, usage
 		"model":   e.model,
 		"choices": []any{choice},
 	}
-	if usage != nil {
+	if usage != nil || e.options.IncludeUsage {
 		chunk["usage"] = usage
 	}
 	return sseFrame(chunk)

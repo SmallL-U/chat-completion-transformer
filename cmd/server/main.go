@@ -12,6 +12,7 @@ import (
 
 	"chat-completion-transformer/internal/config"
 	"chat-completion-transformer/internal/httpapi"
+	"chat-completion-transformer/internal/upstream"
 	"chat-completion-transformer/pkg/transformer"
 
 	"github.com/gin-gonic/gin"
@@ -43,7 +44,12 @@ func run() error {
 		return fmt.Errorf("create transformer: %w", err)
 	}
 
-	router, err := httpapi.NewRouter(service, httpapi.Limits{
+	upstreamClient, err := upstream.New(settings.Gateway, nil)
+	if err != nil {
+		return fmt.Errorf("create upstream client: %w", err)
+	}
+
+	router, err := httpapi.NewRouter(service, upstreamClient, httpapi.Limits{
 		MaxBodyBytes:   settings.Server.MaxBodyBytes,
 		MaxStreamBytes: settings.Server.MaxStreamBytes,
 	})
