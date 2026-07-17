@@ -1,0 +1,17 @@
+server:
+  address: ":8080"
+  gin_mode: "release"
+  read_header_timeout: "5s"
+  idle_timeout: "1m"
+  shutdown_timeout: "10s"
+  max_body_bytes: 1048576
+  max_stream_bytes: 67108864
+  max_sse_event_bytes: 8388608
+
+transformer:
+  mode: "compatible"
+  instruction_policy: "preserve_messages"
+  anthropic_endpoint: "messages"
+  default_max_output_tokens: null
+  profiles: []
+  routes: []
