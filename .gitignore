@@ -1,0 +1,16 @@
+# Claude
+.claude/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# AI context (keep folder, ignore contents)
+_ai_context/*
+!_ai_context/.gitkeep
