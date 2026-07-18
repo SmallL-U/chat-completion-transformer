@@ -119,9 +119,10 @@ make check
 make run
 ```
 
-The default listener is `127.0.0.1:8080`. If the gateway is exposed remotely,
-terminate TLS at a trusted reverse proxy before forwarding requests; otherwise
-the incoming bearer credential would travel over plaintext HTTP.
+The default listener is `:8080`, which binds to all available network
+interfaces. For local-only access, set `CCT_SERVER_ADDRESS=127.0.0.1:8080`.
+Before exposing the gateway remotely, terminate TLS at a trusted reverse proxy;
+otherwise the incoming bearer credential would travel over plaintext HTTP.
 
 Runtime logs are human-readable on stdout and are also written as JSON to
 `logs/server.log`. The file rotates at 100 MiB, and the current file plus its
