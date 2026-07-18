@@ -94,8 +94,31 @@ func TestLoadYAML(t *testing.T) {
 	if !profile.MidConversationSystem || !profile.Images.FileID || !profile.Content.File {
 		t.Fatalf("profile snake_case fields were not decoded: %+v", profile)
 	}
+	if profile.PromptCache.Mode != capabilities.PromptCacheNone {
+		t.Fatalf("PromptCache.Mode = %q, want %q", profile.PromptCache.Mode, capabilities.PromptCacheNone)
+	}
 	if len(config.Transformer.Routes) != 1 || config.Transformer.Routes[0].Targets[capabilities.EndpointResponses] != "gpt-test" {
 		t.Fatalf("Routes = %+v, want responses route", config.Transformer.Routes)
+	}
+}
+
+func TestLoadPromptCacheYAML(t *testing.T) {
+	clearConfigEnvironment(t)
+	configYAML := strings.Replace(
+		validYAML,
+		"      content:\n",
+		"      prompt_cache:\n        mode: \"openai_5_6\"\n      content:\n",
+		1,
+	)
+
+	config, err := Load(writeConfig(t, configYAML))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	cache := config.Transformer.Profiles[0].PromptCache
+	if cache.Mode != capabilities.PromptCacheOpenAI56 {
+		t.Fatalf("PromptCache = %+v, want OpenAI 5.6 mode", cache)
 	}
 }
 
@@ -191,11 +214,29 @@ func TestLoadComplexEnvironmentOverrides(t *testing.T) {
 	if len(config.Transformer.Profiles) != 1 || config.Transformer.Profiles[0].Model != "claude-env" {
 		t.Fatalf("Profiles = %+v, want JSON environment profiles", config.Transformer.Profiles)
 	}
+	if config.Transformer.Profiles[0].PromptCache.Mode != capabilities.PromptCacheNone {
+		t.Fatalf("PromptCache.Mode = %q, want %q", config.Transformer.Profiles[0].PromptCache.Mode, capabilities.PromptCacheNone)
+	}
 	if len(config.Transformer.Routes) != 1 || config.Transformer.Routes[0].Alias != "environment" {
 		t.Fatalf("Routes = %+v, want JSON environment routes", config.Transformer.Routes)
 	}
 	if config.Gateway.Routes["environment"] != "anthropic-main" {
 		t.Fatalf("Gateway routes = %+v, want environment route", config.Gateway.Routes)
+	}
+}
+
+func TestLoadPromptCacheJSONEnvironment(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("CCT_TRANSFORMER_PROFILES", `[{"provider":"openai","endpoint":"responses","model":"gpt-test","prompt_cache":{"mode":"openai_legacy","in_memory_retention":true,"extended_retention_24h":true},"content":{"text":true}}]`)
+
+	config, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	cache := config.Transformer.Profiles[0].PromptCache
+	if cache.Mode != capabilities.PromptCacheOpenAILegacy || !cache.InMemoryRetention || !cache.ExtendedRetention24h {
+		t.Fatalf("PromptCache = %+v, want legacy mode with both retention flags", cache)
 	}
 }
 
@@ -285,6 +326,63 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		_, err := Load(writeConfig(t, validYAML))
 		if err == nil || !strings.Contains(err.Error(), "unknown field") {
 			t.Fatalf("Load() error = %v, want unknown field error", err)
+		}
+	})
+
+	t.Run("unknown prompt cache JSON environment field", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		t.Setenv("CCT_TRANSFORMER_PROFILES", `[{"provider":"openai","endpoint":"responses","model":"gpt-test","prompt_cache":{"mode":"openai_5_6","typo":true}}]`)
+
+		_, err := Load(writeConfig(t, validYAML))
+		if err == nil || !strings.Contains(err.Error(), "unknown field") || !strings.Contains(err.Error(), "typo") {
+			t.Fatalf("Load() error = %v, want unknown nested prompt cache field error", err)
+		}
+	})
+
+	t.Run("unknown prompt cache YAML field", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		configYAML := strings.Replace(
+			validYAML,
+			"      content:\n",
+			"      prompt_cache:\n        mode: \"openai_5_6\"\n        typo: true\n      content:\n",
+			1,
+		)
+
+		_, err := Load(writeConfig(t, configYAML))
+		if err == nil || !strings.Contains(err.Error(), "typo") {
+			t.Fatalf("Load() error = %v, want unknown nested prompt cache YAML field error", err)
+		}
+	})
+
+	t.Run("invalid prompt cache profile combinations", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			profiles string
+		}{
+			{
+				name:     "anthropic mode on Responses",
+				profiles: `[{"provider":"openai","endpoint":"responses","model":"gpt-test","prompt_cache":{"mode":"anthropic"}}]`,
+			},
+			{
+				name:     "OpenAI mode on Messages",
+				profiles: `[{"provider":"anthropic","endpoint":"messages","model":"claude-test","prompt_cache":{"mode":"openai_5_6"}}]`,
+			},
+			{
+				name:     "retention flag outside legacy mode",
+				profiles: `[{"provider":"openai","endpoint":"responses","model":"gpt-test","prompt_cache":{"mode":"openai_5_6","in_memory_retention":true}}]`,
+			},
+		}
+
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				clearConfigEnvironment(t)
+				t.Setenv("CCT_TRANSFORMER_PROFILES", test.profiles)
+
+				_, err := Load(writeConfig(t, validYAML))
+				if err == nil || !strings.Contains(err.Error(), "invalid capability profile") {
+					t.Fatalf("Load() error = %v, want invalid prompt cache profile error", err)
+				}
+			})
 		}
 	})
 

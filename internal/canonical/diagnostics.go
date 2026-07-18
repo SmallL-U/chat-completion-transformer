@@ -36,6 +36,11 @@ const (
 	DiagnosticSamplingParameterUnsupported     DiagnosticCode = "sampling_parameter_unsupported"
 	DiagnosticResponseFormatLossy              DiagnosticCode = "response_format_lossy"
 	DiagnosticModelMappingMissing              DiagnosticCode = "model_mapping_missing"
+	DiagnosticInvalidCacheControl              DiagnosticCode = "invalid_cache_control"
+	DiagnosticCacheControlUnsupported          DiagnosticCode = "cache_control_unsupported"
+	DiagnosticCacheControlProviderMismatch     DiagnosticCode = "cache_control_provider_mismatch"
+	DiagnosticCacheBreakpointUnsupported       DiagnosticCode = "cache_breakpoint_unsupported"
+	DiagnosticInvalidCacheUsage                DiagnosticCode = "invalid_cache_usage"
 )
 
 // Diagnostic describes a lossy or invalid transformation.

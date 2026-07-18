@@ -246,20 +246,7 @@ func EncodeRequest(
 		}
 	}
 
-	extensionNames := make([]string, 0, len(request.Extensions))
-	for name := range request.Extensions {
-		extensionNames = append(extensionNames, name)
-	}
-	sort.Strings(extensionNames)
-	for _, name := range extensionNames {
-		diagnostics = append(diagnostics, lossyDiagnostic(
-			mode,
-			DiagnosticUnsupportedExtension,
-			fmt.Sprintf("canonical extension %q is not forwarded to OpenAI Responses", name),
-			"extensions."+name,
-			request.Extensions[name],
-		))
-	}
+	diagnostics = append(diagnostics, encodePromptCacheExtensions(value, request.Extensions, options.Profile, mode)...)
 
 	return canonical.Success(value, diagnostics)
 }
@@ -279,6 +266,11 @@ func extractInstructions(
 	}
 	if prefixEnd == 0 {
 		return "", 0, nil
+	}
+	for index := 0; index < prefixEnd; index++ {
+		if turnHasPartExtensions(turns[index]) {
+			return "", 0, nil
+		}
 	}
 
 	for index := prefixEnd; index < len(turns); index++ {
@@ -353,7 +345,23 @@ func encodeInput(
 
 	for relativeIndex, turn := range turns {
 		turnIndex := relativeIndex + offset
+		if turn.Kind != canonical.TurnToolResults {
+			diagnostics = append(diagnostics, diagnoseOmittedToolResultCacheExtensions(
+				turn.Results,
+				profile,
+				mode,
+				turnIndex,
+			)...)
+		}
 		if isInstructionTurn(turn) && seenNonInstruction && !profile.MidConversationSystem {
+			diagnostics = append(diagnostics, diagnoseOmittedTurnCacheExtensions(
+				turn.Content,
+				turn.Role,
+				true,
+				profile,
+				mode,
+				fmt.Sprintf("turns.%d.content", turnIndex),
+			)...)
 			diagnostics = append(diagnostics, lossyDiagnostic(
 				mode,
 				canonical.DiagnosticMidConversationSystemUnsupported,
@@ -367,12 +375,28 @@ func encodeInput(
 			seenNonInstruction = true
 		}
 		if turn.Kind == canonical.TurnToolResults {
+			diagnostics = append(diagnostics, diagnoseOmittedTurnCacheExtensions(
+				turn.Content,
+				canonical.Role(""),
+				false,
+				profile,
+				mode,
+				fmt.Sprintf("turns.%d.content", turnIndex),
+			)...)
 			items, itemDiagnostics := encodeToolResults(ctx, turn.Results, profile, resolver, mode, turnIndex)
 			input = append(input, items...)
 			diagnostics = append(diagnostics, itemDiagnostics...)
 			continue
 		}
 		if turn.Kind != canonical.TurnMessage {
+			diagnostics = append(diagnostics, diagnoseOmittedTurnCacheExtensions(
+				turn.Content,
+				canonical.Role(""),
+				false,
+				profile,
+				mode,
+				fmt.Sprintf("turns.%d.content", turnIndex),
+			)...)
 			diagnostics = append(diagnostics, lossyDiagnostic(
 				mode,
 				DiagnosticUnsupportedRequestField,
@@ -383,6 +407,14 @@ func encodeInput(
 			continue
 		}
 		if !validRole(turn.Role) {
+			diagnostics = append(diagnostics, diagnoseOmittedTurnCacheExtensions(
+				turn.Content,
+				canonical.Role(""),
+				false,
+				profile,
+				mode,
+				fmt.Sprintf("turns.%d.content", turnIndex),
+			)...)
 			diagnostics = append(diagnostics, diagnostic(
 				canonical.SeverityError,
 				DiagnosticUnsupportedRequestField,
@@ -454,6 +486,82 @@ func encodeInput(
 	return input, diagnostics
 }
 
+func diagnoseOmittedTurnCacheExtensions(
+	parts []canonical.Part,
+	role canonical.Role,
+	allowPromptCacheBreakpoint bool,
+	profile capabilities.Profile,
+	mode canonical.Mode,
+	basePath string,
+) []canonical.Diagnostic {
+	diagnostics := make([]canonical.Diagnostic, 0)
+	for partIndex, part := range parts {
+		part.Extensions = promptCacheExtensionsOnly(part.Extensions)
+		if len(part.Extensions) == 0 {
+			continue
+		}
+		path := fmt.Sprintf("%s.%d", basePath, partIndex)
+		breakpoint, partDiagnostics := encodeContentPartExtensions(
+			part,
+			role,
+			profile,
+			mode,
+			path,
+			allowPromptCacheBreakpoint,
+		)
+		diagnostics = append(diagnostics, partDiagnostics...)
+		if breakpoint == nil {
+			continue
+		}
+		diagnostics = append(diagnostics, invalidCacheBreakpointDiagnostic(
+			"prompt cache breakpoint cannot be attached to an omitted Responses message",
+			path+".extensions.prompt_cache_breakpoint",
+			part.Extensions["prompt_cache_breakpoint"],
+		))
+	}
+	return diagnostics
+}
+
+func diagnoseOmittedToolResultCacheExtensions(
+	results []canonical.ToolResult,
+	profile capabilities.Profile,
+	mode canonical.Mode,
+	turnIndex int,
+) []canonical.Diagnostic {
+	diagnostics := make([]canonical.Diagnostic, 0)
+	for resultIndex, result := range results {
+		diagnostics = append(diagnostics, diagnoseOmittedTurnCacheExtensions(
+			result.Content,
+			canonical.Role(""),
+			false,
+			profile,
+			mode,
+			fmt.Sprintf("turns.%d.results.%d.content", turnIndex, resultIndex),
+		)...)
+	}
+	return diagnostics
+}
+
+func promptCacheExtensionsOnly(extensions canonical.Object) canonical.Object {
+	result := make(canonical.Object)
+	for _, name := range []string{
+		"cache_control",
+		"prompt_cache_key",
+		"prompt_cache_options",
+		"prompt_cache_retention",
+		"prompt_cache_breakpoint",
+	} {
+		raw, exists := extensions[name]
+		if exists {
+			result[name] = raw
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
 func encodeMessageContent(
 	ctx context.Context,
 	role canonical.Role,
@@ -466,7 +574,7 @@ func encodeMessageContent(
 	if len(parts) == 0 {
 		return nil, false, nil
 	}
-	if allText(parts) {
+	if allPlainText(parts) {
 		if !profile.Content.Text {
 			diagnostic := unsupportedPartDiagnostic(mode, "text", path, parts)
 			return nil, false, []canonical.Diagnostic{diagnostic}
@@ -482,7 +590,7 @@ func encodeMessageContent(
 	diagnostics := make([]canonical.Diagnostic, 0)
 	for index, part := range parts {
 		partPath := fmt.Sprintf("%s.%d", path, index)
-		item, ok, itemDiagnostics := encodeContentPart(ctx, role, part, profile, resolver, mode, partPath)
+		item, ok, itemDiagnostics := encodeContentPart(ctx, role, part, profile, resolver, mode, partPath, true)
 		diagnostics = append(diagnostics, itemDiagnostics...)
 		if ok {
 			content = append(content, item)
@@ -495,6 +603,50 @@ func encodeMessageContent(
 }
 
 func encodeContentPart(
+	ctx context.Context,
+	role canonical.Role,
+	part canonical.Part,
+	profile capabilities.Profile,
+	resolver assets.Resolver,
+	mode canonical.Mode,
+	path string,
+	allowPromptCacheBreakpoint bool,
+) (any, bool, []canonical.Diagnostic) {
+	breakpoint, extensionDiagnostics := encodeContentPartExtensions(
+		part,
+		role,
+		profile,
+		mode,
+		path,
+		allowPromptCacheBreakpoint && role != canonical.RoleAssistant,
+	)
+	item, ok, partDiagnostics := encodeContentPartValue(ctx, role, part, profile, resolver, mode, path)
+	diagnostics := append(extensionDiagnostics, partDiagnostics...)
+	if breakpoint == nil {
+		return item, ok, diagnostics
+	}
+	if !ok {
+		diagnostics = append(diagnostics, invalidCacheBreakpointDiagnostic(
+			"prompt cache breakpoint cannot be attached to an omitted Responses content block",
+			path+".extensions.prompt_cache_breakpoint",
+			part.Extensions["prompt_cache_breakpoint"],
+		))
+		return item, false, diagnostics
+	}
+	encoded, mapOK := item.(map[string]any)
+	if !mapOK {
+		diagnostics = append(diagnostics, invalidCacheBreakpointDiagnostic(
+			"prompt cache breakpoint requires an object content block",
+			path+".extensions.prompt_cache_breakpoint",
+			part.Extensions["prompt_cache_breakpoint"],
+		))
+		return item, ok, diagnostics
+	}
+	encoded["prompt_cache_breakpoint"] = breakpoint
+	return encoded, true, diagnostics
+}
+
+func encodeContentPartValue(
 	ctx context.Context,
 	role canonical.Role,
 	part canonical.Part,
@@ -677,7 +829,7 @@ func encodeToolOutput(
 	if len(parts) == 0 {
 		return "", nil
 	}
-	if allText(parts) {
+	if allPlainText(parts) {
 		if !profile.Content.Text {
 			return "", []canonical.Diagnostic{unsupportedPartDiagnostic(mode, "text", path, parts)}
 		}
@@ -692,7 +844,7 @@ func encodeToolOutput(
 	diagnostics := make([]canonical.Diagnostic, 0)
 	for index, part := range parts {
 		partPath := fmt.Sprintf("%s.%d", path, index)
-		item, ok, itemDiagnostics := encodeContentPart(ctx, canonical.RoleUser, part, profile, resolver, mode, partPath)
+		item, ok, itemDiagnostics := encodeContentPart(ctx, canonical.Role("tool_result"), part, profile, resolver, mode, partPath, false)
 		diagnostics = append(diagnostics, itemDiagnostics...)
 		if ok {
 			content = append(content, item)
@@ -711,6 +863,7 @@ func encodeTools(
 	seenNames := make(map[string]int, len(tools))
 	for index, tool := range tools {
 		path := fmt.Sprintf("tools.%d", index)
+		diagnostics = append(diagnostics, encodeToolExtensions(tool.Extensions, mode, path)...)
 		validSchema := true
 		if strings.TrimSpace(tool.Name) == "" {
 			diagnostics = append(diagnostics, diagnostic(
@@ -785,6 +938,409 @@ func encodeTools(
 		encoded = append(encoded, item)
 	}
 	return encoded, diagnostics
+}
+
+func encodePromptCacheExtensions(
+	value map[string]any,
+	extensions canonical.Object,
+	profile capabilities.Profile,
+	mode canonical.Mode,
+) []canonical.Diagnostic {
+	diagnostics := make([]canonical.Diagnostic, 0)
+	cacheMode := normalizedPromptCacheMode(profile.PromptCache.Mode)
+	for _, name := range sortedObjectNames(extensions) {
+		raw := extensions[name]
+		path := "extensions." + name
+		switch name {
+		case "prompt_cache_key":
+			key, err := decodeCacheString(raw, name)
+			if err != nil || strings.TrimSpace(key) == "" {
+				message := "prompt_cache_key must be a non-empty string"
+				if err != nil {
+					message = err.Error()
+				}
+				diagnostics = append(diagnostics, invalidCacheControlDiagnostic(message, path, raw))
+				continue
+			}
+			if cacheMode != capabilities.PromptCacheOpenAILegacy && cacheMode != capabilities.PromptCacheOpenAI56 {
+				diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+					mode,
+					canonical.DiagnosticCacheControlUnsupported,
+					"prompt_cache_key is not supported by the selected Responses cache profile",
+					path,
+					raw,
+				))
+				continue
+			}
+			value[name] = key
+		case "prompt_cache_retention":
+			retention, err := decodePromptCacheRetention(raw)
+			if err != nil {
+				diagnostics = append(diagnostics, invalidCacheControlDiagnostic(err.Error(), path, raw))
+				continue
+			}
+			if cacheMode != capabilities.PromptCacheOpenAILegacy {
+				diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+					mode,
+					canonical.DiagnosticCacheControlUnsupported,
+					"prompt_cache_retention is only supported by legacy Responses cache profiles",
+					path,
+					raw,
+				))
+				continue
+			}
+			if retention == "in_memory" && !profile.PromptCache.InMemoryRetention {
+				diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+					mode,
+					canonical.DiagnosticCacheControlUnsupported,
+					"the selected Responses cache profile does not support in_memory retention",
+					path,
+					raw,
+				))
+				continue
+			}
+			if retention == "24h" && !profile.PromptCache.ExtendedRetention24h {
+				diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+					mode,
+					canonical.DiagnosticCacheControlUnsupported,
+					"the selected Responses cache profile does not support 24h retention",
+					path,
+					raw,
+				))
+				continue
+			}
+			value[name] = retention
+		case "prompt_cache_options":
+			options, err := decodePromptCacheOptions(raw)
+			if err != nil {
+				diagnostics = append(diagnostics, invalidCacheControlDiagnostic(err.Error(), path, raw))
+				continue
+			}
+			if cacheMode != capabilities.PromptCacheOpenAI56 {
+				diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+					mode,
+					canonical.DiagnosticCacheControlUnsupported,
+					"prompt_cache_options requires an OpenAI 5.6+ Responses cache profile",
+					path,
+					raw,
+				))
+				continue
+			}
+			value[name] = options
+		case "cache_control":
+			if err := validateAnthropicCacheControl(raw); err != nil {
+				diagnostics = append(diagnostics, invalidCacheControlDiagnostic(err.Error(), path, raw))
+				continue
+			}
+			diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+				mode,
+				canonical.DiagnosticCacheControlProviderMismatch,
+				"Anthropic cache_control is not forwarded to OpenAI Responses",
+				path,
+				raw,
+			))
+		case "prompt_cache_breakpoint":
+			diagnostics = append(diagnostics, invalidCacheBreakpointDiagnostic(
+				"prompt_cache_breakpoint is only valid on supported input content blocks",
+				path,
+				raw,
+			))
+		default:
+			diagnostics = append(diagnostics, lossyDiagnostic(
+				mode,
+				DiagnosticUnsupportedExtension,
+				fmt.Sprintf("canonical extension %q is not forwarded to OpenAI Responses", name),
+				path,
+				raw,
+			))
+		}
+	}
+	return diagnostics
+}
+
+func encodeContentPartExtensions(
+	part canonical.Part,
+	role canonical.Role,
+	profile capabilities.Profile,
+	mode canonical.Mode,
+	path string,
+	allowPromptCacheBreakpoint bool,
+) (map[string]any, []canonical.Diagnostic) {
+	diagnostics := make([]canonical.Diagnostic, 0)
+	var breakpoint map[string]any
+	for _, name := range sortedObjectNames(part.Extensions) {
+		raw := part.Extensions[name]
+		extensionPath := path + ".extensions." + name
+		switch name {
+		case "prompt_cache_breakpoint":
+			parsed, err := decodePromptCacheBreakpoint(raw)
+			if err != nil {
+				diagnostics = append(diagnostics, invalidCacheControlDiagnostic(err.Error(), extensionPath, raw))
+				continue
+			}
+			if !allowPromptCacheBreakpoint || (part.Kind != canonical.PartText && part.Kind != canonical.PartImage && part.Kind != canonical.PartFile) {
+				diagnostics = append(diagnostics, invalidCacheBreakpointDiagnostic(
+					"Responses prompt cache breakpoints are only valid on input_text, input_image, and input_file blocks",
+					extensionPath,
+					raw,
+				))
+				continue
+			}
+			if normalizedPromptCacheMode(profile.PromptCache.Mode) != capabilities.PromptCacheOpenAI56 {
+				diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+					mode,
+					canonical.DiagnosticCacheBreakpointUnsupported,
+					"prompt_cache_breakpoint requires an OpenAI 5.6+ Responses cache profile",
+					extensionPath,
+					raw,
+				))
+				continue
+			}
+			breakpoint = parsed
+		case "cache_control":
+			if err := validateAnthropicCacheControl(raw); err != nil {
+				diagnostics = append(diagnostics, invalidCacheControlDiagnostic(err.Error(), extensionPath, raw))
+				continue
+			}
+			if !validAnthropicCacheControlPosition(part, role) {
+				diagnostics = append(diagnostics, invalidCacheBreakpointDiagnostic(
+					"Anthropic cache_control is only valid on supported system or message content blocks",
+					extensionPath,
+					raw,
+				))
+				continue
+			}
+			diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+				mode,
+				canonical.DiagnosticCacheControlProviderMismatch,
+				"Anthropic cache_control is not forwarded to OpenAI Responses",
+				extensionPath,
+				raw,
+			))
+		case "prompt_cache_key", "prompt_cache_options", "prompt_cache_retention":
+			diagnostics = append(diagnostics, invalidCacheControlDiagnostic(
+				fmt.Sprintf("cache directive %q is only valid at the request top level", name),
+				extensionPath,
+				raw,
+			))
+		default:
+			diagnostics = append(diagnostics, lossyDiagnostic(
+				mode,
+				DiagnosticUnsupportedExtension,
+				fmt.Sprintf("canonical content extension %q is not forwarded to OpenAI Responses", name),
+				extensionPath,
+				raw,
+			))
+		}
+	}
+	return breakpoint, diagnostics
+}
+
+func encodeToolExtensions(extensions canonical.Object, mode canonical.Mode, path string) []canonical.Diagnostic {
+	diagnostics := make([]canonical.Diagnostic, 0)
+	for _, name := range sortedObjectNames(extensions) {
+		raw := extensions[name]
+		extensionPath := path + ".extensions." + name
+		if name == "cache_control" {
+			if err := validateAnthropicCacheControl(raw); err != nil {
+				diagnostics = append(diagnostics, invalidCacheControlDiagnostic(err.Error(), extensionPath, raw))
+				continue
+			}
+			diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+				mode,
+				canonical.DiagnosticCacheControlProviderMismatch,
+				"Anthropic tool cache_control is not forwarded to OpenAI Responses",
+				extensionPath,
+				raw,
+			))
+			continue
+		}
+		if name == "prompt_cache_key" || name == "prompt_cache_options" || name == "prompt_cache_retention" {
+			diagnostics = append(diagnostics, invalidCacheControlDiagnostic(
+				fmt.Sprintf("cache directive %q is only valid at the request top level", name),
+				extensionPath,
+				raw,
+			))
+			continue
+		}
+		if name == "prompt_cache_breakpoint" {
+			diagnostics = append(diagnostics, invalidCacheBreakpointDiagnostic(
+				"prompt_cache_breakpoint is not valid on tool definitions",
+				extensionPath,
+				raw,
+			))
+			continue
+		}
+		diagnostics = append(diagnostics, lossyDiagnostic(
+			mode,
+			DiagnosticUnsupportedExtension,
+			fmt.Sprintf("canonical tool extension %q is not forwarded to OpenAI Responses", name),
+			extensionPath,
+			raw,
+		))
+	}
+	return diagnostics
+}
+
+func decodePromptCacheRetention(raw json.RawMessage) (string, error) {
+	value, err := decodeCacheString(raw, "prompt_cache_retention")
+	if err != nil {
+		return "", err
+	}
+	if value != "in_memory" && value != "24h" {
+		return "", fmt.Errorf("prompt_cache_retention must be %q or %q", "in_memory", "24h")
+	}
+	return value, nil
+}
+
+func validateAnthropicCacheControl(raw json.RawMessage) error {
+	object, err := canonical.DecodeObject(raw)
+	if err != nil {
+		return fmt.Errorf("cache_control must be an object: %w", err)
+	}
+	typeRaw, exists := object["type"]
+	if !exists {
+		return fmt.Errorf("cache_control.type is required")
+	}
+	typeName, err := decodeCacheString(typeRaw, "cache_control.type")
+	if err != nil {
+		return err
+	}
+	if typeName != "ephemeral" {
+		return fmt.Errorf("cache_control.type must be %q", "ephemeral")
+	}
+	if ttlRaw, exists := object["ttl"]; exists {
+		ttl, decodeErr := decodeCacheString(ttlRaw, "cache_control.ttl")
+		if decodeErr != nil {
+			return decodeErr
+		}
+		if ttl != "5m" && ttl != "1h" {
+			return fmt.Errorf("cache_control.ttl must be %q or %q", "5m", "1h")
+		}
+	}
+	for name := range object {
+		if name != "type" && name != "ttl" {
+			return fmt.Errorf("cache_control contains unsupported field %q", name)
+		}
+	}
+	return nil
+}
+
+func validAnthropicCacheControlPosition(part canonical.Part, role canonical.Role) bool {
+	if !validRole(role) {
+		return false
+	}
+	if part.Kind == canonical.PartText {
+		return part.Text != ""
+	}
+	if part.Kind != canonical.PartImage && part.Kind != canonical.PartFile {
+		return false
+	}
+	return role == canonical.RoleUser
+}
+
+func decodePromptCacheOptions(raw json.RawMessage) (map[string]any, error) {
+	object, err := canonical.DecodeObject(raw)
+	if err != nil {
+		return nil, fmt.Errorf("prompt_cache_options must be an object: %w", err)
+	}
+	for name := range object {
+		if name != "mode" && name != "ttl" {
+			return nil, fmt.Errorf("prompt_cache_options contains unsupported field %q", name)
+		}
+	}
+
+	value := make(map[string]any, len(object))
+	if modeRaw, exists := object["mode"]; exists {
+		cacheMode, decodeErr := decodeCacheString(modeRaw, "prompt_cache_options.mode")
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		if cacheMode != "implicit" && cacheMode != "explicit" {
+			return nil, fmt.Errorf("prompt_cache_options.mode must be %q or %q", "implicit", "explicit")
+		}
+		value["mode"] = cacheMode
+	}
+	if ttlRaw, exists := object["ttl"]; exists {
+		ttl, decodeErr := decodeCacheString(ttlRaw, "prompt_cache_options.ttl")
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		if ttl != "30m" {
+			return nil, fmt.Errorf("prompt_cache_options.ttl must be %q", "30m")
+		}
+		value["ttl"] = ttl
+	}
+	return value, nil
+}
+
+func decodePromptCacheBreakpoint(raw json.RawMessage) (map[string]any, error) {
+	object, err := canonical.DecodeObject(raw)
+	if err != nil {
+		return nil, fmt.Errorf("prompt_cache_breakpoint must be an object: %w", err)
+	}
+	for name := range object {
+		if name != "mode" {
+			return nil, fmt.Errorf("prompt_cache_breakpoint contains unsupported field %q", name)
+		}
+	}
+	modeRaw, exists := object["mode"]
+	if !exists {
+		return nil, fmt.Errorf("prompt_cache_breakpoint.mode is required")
+	}
+	cacheMode, err := decodeCacheString(modeRaw, "prompt_cache_breakpoint.mode")
+	if err != nil {
+		return nil, err
+	}
+	if cacheMode != "explicit" {
+		return nil, fmt.Errorf("prompt_cache_breakpoint.mode must be %q", "explicit")
+	}
+	return map[string]any{"mode": cacheMode}, nil
+}
+
+func decodeCacheString(raw json.RawMessage, path string) (string, error) {
+	if !hasJSONValue(raw) {
+		return "", fmt.Errorf("%s must be a string", path)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("%s must be a string", path)
+	}
+	return value, nil
+}
+
+func invalidCacheControlDiagnostic(message string, path string, source any) canonical.Diagnostic {
+	return diagnostic(canonical.SeverityError, canonical.DiagnosticInvalidCacheControl, message, path, source)
+}
+
+func invalidCacheBreakpointDiagnostic(message string, path string, source any) canonical.Diagnostic {
+	return diagnostic(canonical.SeverityError, canonical.DiagnosticCacheBreakpointUnsupported, message, path, source)
+}
+
+func unsupportedCacheControlDiagnostic(
+	mode canonical.Mode,
+	code canonical.DiagnosticCode,
+	message string,
+	path string,
+	source any,
+) canonical.Diagnostic {
+	return lossyDiagnostic(mode, code, message, path, source)
+}
+
+func normalizedPromptCacheMode(mode capabilities.PromptCacheMode) capabilities.PromptCacheMode {
+	if mode == capabilities.PromptCacheUnset {
+		return capabilities.PromptCacheNone
+	}
+	return mode
+}
+
+func sortedObjectNames(object canonical.Object) []string {
+	names := make([]string, 0, len(object))
+	for name := range object {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func validateRequestTurns(turns []canonical.Turn) []canonical.Diagnostic {
@@ -1034,13 +1590,22 @@ func supportsFileSource(profile capabilities.Profile, kind canonical.AssetSource
 	}
 }
 
-func allText(parts []canonical.Part) bool {
+func allPlainText(parts []canonical.Part) bool {
 	for _, part := range parts {
-		if part.Kind != canonical.PartText {
+		if part.Kind != canonical.PartText || len(part.Extensions) > 0 {
 			return false
 		}
 	}
 	return true
+}
+
+func turnHasPartExtensions(turn canonical.Turn) bool {
+	for _, part := range turn.Content {
+		if len(part.Extensions) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func hasRefusal(parts []canonical.Part) bool {

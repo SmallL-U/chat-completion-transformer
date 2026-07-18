@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"chat-completion-transformer/internal/canonical"
+
+	"github.com/tidwall/sjson"
 )
 
 const (
@@ -35,6 +37,7 @@ type StreamEncoder struct {
 	openTools    map[int]bool
 	nextTool     int
 	pendingUsage *canonical.Usage
+	deltaBase    []byte
 }
 
 func NewStreamEncoder(options StreamEncodeOptions) *StreamEncoder {
@@ -85,13 +88,14 @@ func (e *StreamEncoder) Encode(event canonical.Event) canonical.Result[[][]byte]
 		e.id = id
 		e.model = model
 		e.options.Created = created
+		e.deltaBase = nil
 		frames = append(frames, e.ensureRole(&diagnostics)...)
 	case canonical.EventTextDelta:
 		frames = append(frames, e.ensureRole(&diagnostics)...)
-		frames = append(frames, e.chunkFrame(map[string]any{"content": event.Delta}, nil, nil))
+		frames = append(frames, e.deltaFrame("content", event.Delta))
 	case canonical.EventRefusalDelta:
 		frames = append(frames, e.ensureRole(&diagnostics)...)
-		frames = append(frames, e.chunkFrame(map[string]any{"refusal": event.Delta}, nil, nil))
+		frames = append(frames, e.deltaFrame("refusal", event.Delta))
 	case canonical.EventToolCallStart:
 		if event.OutputIndex == nil || event.CallID == "" || event.Name == "" {
 			diagnostics = append(diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidStreamEvent, "tool_call_start requires output_index, call_id, and name", "", event.Value))
@@ -152,8 +156,10 @@ func (e *StreamEncoder) Encode(event canonical.Event) canonical.Result[[][]byte]
 			diagnostics = append(diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidStreamEvent, "usage event requires usage", "", event.Value))
 			break
 		}
-		if len(event.Usage.Extensions) > 0 {
-			diagnostics = append(diagnostics, lossyDiagnostic(e.options.Mode, diagnosticResponseExtensionLossy, "provider usage extensions cannot be represented by Chat Completions", "usage.extensions", mustMarshal(event.Usage.Extensions)))
+		diagnostics = append(diagnostics, validateCanonicalCacheUsage(*event.Usage)...)
+		unknownExtensions := unknownUsageExtensions(event.Usage.Extensions)
+		if len(unknownExtensions) > 0 {
+			diagnostics = append(diagnostics, lossyDiagnostic(e.options.Mode, diagnosticResponseExtensionLossy, "provider usage extensions cannot be represented by Chat Completions", "usage.extensions", mustMarshal(unknownExtensions)))
 		}
 		if canonical.HasErrors(diagnostics) {
 			break
@@ -230,6 +236,10 @@ func (e *StreamEncoder) ensureRole(diagnostics *[]canonical.Diagnostic) [][]byte
 }
 
 func (e *StreamEncoder) chunkFrame(delta map[string]any, finishReason any, usage any) []byte {
+	return sseFrame(e.chunkValue(delta, finishReason, usage))
+}
+
+func (e *StreamEncoder) chunkValue(delta map[string]any, finishReason any, usage any) map[string]any {
 	choice := map[string]any{
 		"index":         0,
 		"delta":         delta,
@@ -246,7 +256,41 @@ func (e *StreamEncoder) chunkFrame(delta map[string]any, finishReason any, usage
 	if usage != nil || e.options.IncludeUsage {
 		chunk["usage"] = usage
 	}
-	return sseFrame(chunk)
+	return chunk
+}
+
+func (e *StreamEncoder) deltaFrame(field string, delta string) []byte {
+	path := "choices.0.delta.content"
+	if field == "refusal" {
+		path = "choices.0.delta.refusal"
+	} else if field != "content" {
+		return e.chunkFrame(map[string]any{field: delta}, nil, nil)
+	}
+	base := e.deltaChunkBase()
+	if len(base) == 0 {
+		return e.chunkFrame(map[string]any{field: delta}, nil, nil)
+	}
+	rawDelta, err := json.Marshal(delta)
+	if err != nil {
+		return e.chunkFrame(map[string]any{field: delta}, nil, nil)
+	}
+	encoded, err := sjson.SetRawBytes(base, path, rawDelta)
+	if err != nil {
+		return e.chunkFrame(map[string]any{field: delta}, nil, nil)
+	}
+	return rawSSEFrame(encoded)
+}
+
+func (e *StreamEncoder) deltaChunkBase() []byte {
+	if len(e.deltaBase) > 0 {
+		return e.deltaBase
+	}
+	encoded, err := json.Marshal(e.chunkValue(map[string]any{}, nil, nil))
+	if err != nil {
+		return nil
+	}
+	e.deltaBase = encoded
+	return e.deltaBase
 }
 
 func (e *StreamEncoder) usageFrame(usage canonical.Usage) []byte {
@@ -263,6 +307,10 @@ func (e *StreamEncoder) usageFrame(usage canonical.Usage) []byte {
 
 func sseFrame(value any) []byte {
 	encoded, _ := json.Marshal(value)
+	return rawSSEFrame(encoded)
+}
+
+func rawSSEFrame(encoded []byte) []byte {
 	frame := make([]byte, 0, len(encoded)+8)
 	frame = append(frame, "data: "...)
 	frame = append(frame, encoded...)
@@ -283,16 +331,48 @@ func lenOpenTools(tools map[int]bool) int {
 func mergeUsage(current *canonical.Usage, update canonical.Usage) *canonical.Usage {
 	merged := canonical.Usage{}
 	if current != nil {
-		merged = *current
+		merged.InputTokens = cloneInt64(current.InputTokens)
+		merged.OutputTokens = cloneInt64(current.OutputTokens)
+		merged.TotalTokens = cloneInt64(current.TotalTokens)
+		merged.CachedInputTokens = cloneInt64(current.CachedInputTokens)
+		merged.CacheWriteInputTokens = cloneInt64(current.CacheWriteInputTokens)
+		if len(current.Extensions) > 0 {
+			merged.Extensions = make(canonical.Object, len(current.Extensions))
+			for name, raw := range current.Extensions {
+				merged.Extensions[name] = cloneRaw(raw)
+			}
+		}
 	}
 	if update.InputTokens != nil {
-		merged.InputTokens = update.InputTokens
+		merged.InputTokens = cloneInt64(update.InputTokens)
 	}
 	if update.OutputTokens != nil {
-		merged.OutputTokens = update.OutputTokens
+		merged.OutputTokens = cloneInt64(update.OutputTokens)
 	}
 	if update.TotalTokens != nil {
-		merged.TotalTokens = update.TotalTokens
+		merged.TotalTokens = cloneInt64(update.TotalTokens)
+	}
+	if update.CachedInputTokens != nil {
+		merged.CachedInputTokens = cloneInt64(update.CachedInputTokens)
+	}
+	if update.CacheWriteInputTokens != nil {
+		merged.CacheWriteInputTokens = cloneInt64(update.CacheWriteInputTokens)
+	}
+	if len(update.Extensions) > 0 {
+		if merged.Extensions == nil {
+			merged.Extensions = make(canonical.Object)
+		}
+		for name, raw := range update.Extensions {
+			merged.Extensions[name] = cloneRaw(raw)
+		}
 	}
 	return &merged
+}
+
+func cloneInt64(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }

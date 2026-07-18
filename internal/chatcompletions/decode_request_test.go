@@ -159,6 +159,165 @@ func TestDecodeRequestPreservesUnsupportedFieldsAndTools(t *testing.T) {
 	}
 }
 
+func TestDecodeRequestRecognizesTopLevelCacheExtensions(t *testing.T) {
+	result := DecodeRequest([]byte(`{
+		"model":"general",
+		"messages":[{"role":"user","content":"hello"}],
+		"cache_control":{"type":"ephemeral"},
+		"prompt_cache_key":"tenant:prompt-v1",
+		"prompt_cache_options":{"mode":"explicit","ttl":"30m"},
+		"prompt_cache_retention":"in_memory"
+	}`))
+
+	if !result.OK || result.Value == nil || !result.Lossless {
+		t.Fatalf("result = %#v", result)
+	}
+	want := map[string]string{
+		"cache_control":          `{"type":"ephemeral"}`,
+		"prompt_cache_key":       `"tenant:prompt-v1"`,
+		"prompt_cache_options":   `{"mode":"explicit","ttl":"30m"}`,
+		"prompt_cache_retention": `"in_memory"`,
+	}
+	for name, expected := range want {
+		if got := string(result.Value.Extensions[name]); got != expected {
+			t.Fatalf("extension %s = %s, want %s", name, got, expected)
+		}
+	}
+	if containsDiagnostic(result.Diagnostics, diagnosticRequestFieldPreserved) {
+		t.Fatalf("diagnostics = %#v", result.Diagnostics)
+	}
+}
+
+func TestDecodeRequestAttachesCacheExtensionsToParts(t *testing.T) {
+	result := DecodeRequest([]byte(`{
+		"model":"general",
+		"messages":[{"role":"user","content":[
+			{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}},
+			{"type":"image_url","image_url":{"url":"https://example.com/image.png"},"prompt_cache_breakpoint":{"mode":"explicit"}},
+			{"type":"file","file":{"file_id":"file_123"},"cache_control":{"type":"ephemeral","ttl":"1h"}}
+		]}]
+	}`))
+
+	if !result.OK || result.Value == nil || !result.Lossless {
+		t.Fatalf("result = %#v", result)
+	}
+	parts := result.Value.Turns[0].Content
+	if len(parts) != 3 {
+		t.Fatalf("parts = %#v", parts)
+	}
+	if string(parts[0].Extensions["cache_control"]) != `{"type":"ephemeral"}` {
+		t.Fatalf("text extensions = %#v", parts[0].Extensions)
+	}
+	if string(parts[1].Extensions["prompt_cache_breakpoint"]) != `{"mode":"explicit"}` {
+		t.Fatalf("image extensions = %#v", parts[1].Extensions)
+	}
+	if string(parts[2].Extensions["cache_control"]) != `{"type":"ephemeral","ttl":"1h"}` {
+		t.Fatalf("file extensions = %#v", parts[2].Extensions)
+	}
+	for _, part := range parts {
+		if part.Kind == canonical.PartOpaque {
+			t.Fatalf("cache extension created opaque sibling: %#v", parts)
+		}
+	}
+	if containsDiagnostic(result.Diagnostics, diagnosticContentFieldPreserved) {
+		t.Fatalf("diagnostics = %#v", result.Diagnostics)
+	}
+}
+
+func TestDecodeRequestAttachesCacheControlToToolDefinition(t *testing.T) {
+	result := DecodeRequest([]byte(`{
+		"model":"general",
+		"messages":[{"role":"user","content":"hello"}],
+		"tools":[{"type":"function","cache_control":{"type":"ephemeral"},"function":{"name":"lookup"}}]
+	}`))
+	if !result.OK || result.Value == nil || !result.Lossless {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(result.Value.Tools) != 1 || string(result.Value.Tools[0].Extensions["cache_control"]) != `{"type":"ephemeral"}` {
+		t.Fatalf("tools = %#v", result.Value.Tools)
+	}
+	if _, exists := result.Value.Extensions["tools"]; exists {
+		t.Fatalf("request extensions = %#v", result.Value.Extensions)
+	}
+
+	alias := DecodeRequest([]byte(`{
+		"model":"general",
+		"messages":[{"role":"user","content":"hello"}],
+		"tools":[{"type":"function","function":{"name":"lookup","cache_control":{"type":"ephemeral"}}}]
+	}`))
+	if alias.OK || !containsDiagnostic(alias.Diagnostics, canonical.DiagnosticInvalidCacheControl) {
+		t.Fatalf("function.cache_control alias result = %#v", alias)
+	}
+}
+
+func TestDecodeRequestRejectsCacheDirectivesAtInvalidPositions(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		code canonical.DiagnosticCode
+	}{
+		{
+			name: "top-level breakpoint",
+			body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"prompt_cache_breakpoint":{"mode":"explicit"}}`,
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+		{
+			name: "message wrapper",
+			body: `{"model":"general","messages":[{"role":"user","content":"hello","cache_control":{"type":"ephemeral"}}]}`,
+			code: canonical.DiagnosticInvalidCacheControl,
+		},
+		{
+			name: "content top-level directive",
+			body: `{"model":"general","messages":[{"role":"user","content":[{"type":"text","text":"hello","prompt_cache_key":"key"}]}]}`,
+			code: canonical.DiagnosticInvalidCacheControl,
+		},
+		{
+			name: "unknown content breakpoint",
+			body: `{"model":"general","messages":[{"role":"user","content":[{"type":"future","prompt_cache_breakpoint":{"mode":"explicit"}}]}]}`,
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+		{
+			name: "nested image directive",
+			body: `{"model":"general","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png","cache_control":{"type":"ephemeral"}}}]}]}`,
+			code: canonical.DiagnosticInvalidCacheControl,
+		},
+		{
+			name: "tool top-level OpenAI directive",
+			body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","prompt_cache_options":{"mode":"implicit"},"function":{"name":"lookup"}}]}`,
+			code: canonical.DiagnosticInvalidCacheControl,
+		},
+		{
+			name: "assistant tool call directive",
+			body: `{"model":"general","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call","type":"function","cache_control":{"type":"ephemeral"},"function":{"name":"lookup","arguments":"{}"}}]}]}`,
+			code: canonical.DiagnosticInvalidCacheControl,
+		},
+		{
+			name: "tool message wrapper",
+			body: `{"model":"general","messages":[{"role":"tool","tool_call_id":"call","content":"result","cache_control":{"type":"ephemeral"}}]}`,
+			code: canonical.DiagnosticInvalidCacheControl,
+		},
+		{
+			name: "stream options",
+			body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"stream":true,"stream_options":{"include_usage":true,"prompt_cache_key":"key"}}`,
+			code: canonical.DiagnosticInvalidCacheControl,
+		},
+		{
+			name: "tool choice",
+			body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tool_choice":{"type":"function","cache_control":{"type":"ephemeral"},"function":{"name":"lookup"}}}`,
+			code: canonical.DiagnosticInvalidCacheControl,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := DecodeRequest([]byte(test.body))
+			if result.OK || result.Value != nil || !containsDiagnostic(result.Diagnostics, test.code) {
+				t.Fatalf("result = %#v", result)
+			}
+		})
+	}
+}
+
 func TestDecodeRequestPreservesFutureFieldsInsideKnownStructures(t *testing.T) {
 	const contentBlock = `{"type":"text","text":"hello","future":{"precise":9007199254740993}}`
 	const toolCall = `{"id":"call_1","type":"function","future_call":true,"function":{"name":"lookup","arguments":"{\"q\":1}","future_function":"x"}}`

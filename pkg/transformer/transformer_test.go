@@ -18,6 +18,36 @@ func TestNewValidatesConfiguration(t *testing.T) {
 		{name: "endpoint", config: Config{AnthropicEndpoint: EndpointResponses}},
 		{name: "max tokens", config: Config{DefaultMaxOutputTokens: intPointer(0)}},
 		{name: "profile mismatch", config: Config{Profiles: []CapabilityProfile{{Provider: ProviderOpenAI, Endpoint: EndpointMessages, Model: "x"}}}},
+		{
+			name: "Anthropic cache mode on Responses",
+			config: Config{Profiles: []CapabilityProfile{{
+				Provider:    ProviderOpenAI,
+				Endpoint:    EndpointResponses,
+				Model:       "x",
+				PromptCache: PromptCacheCapabilities{Mode: PromptCacheAnthropic},
+			}}},
+		},
+		{
+			name: "OpenAI cache mode on Messages",
+			config: Config{Profiles: []CapabilityProfile{{
+				Provider:    ProviderAnthropic,
+				Endpoint:    EndpointMessages,
+				Model:       "x",
+				PromptCache: PromptCacheCapabilities{Mode: PromptCacheOpenAI56},
+			}}},
+		},
+		{
+			name: "retention outside legacy cache mode",
+			config: Config{Profiles: []CapabilityProfile{{
+				Provider: ProviderOpenAI,
+				Endpoint: EndpointResponses,
+				Model:    "x",
+				PromptCache: PromptCacheCapabilities{
+					Mode:              PromptCacheOpenAI56,
+					InMemoryRetention: true,
+				},
+			}}},
+		},
 	}
 
 	for _, test := range tests {
@@ -56,6 +86,38 @@ func TestNewCopiesDefaultsAndRegistry(t *testing.T) {
 	model, err := transformer.registry.Resolve("general", EndpointResponses)
 	if err != nil || model != "target" {
 		t.Fatalf("model = %q, error = %v", model, err)
+	}
+	profile, err := transformer.registry.Profile(ProviderOpenAI, EndpointResponses, "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.PromptCache.Mode != PromptCacheNone {
+		t.Fatalf("default prompt cache mode = %q, want %q", profile.PromptCache.Mode, PromptCacheNone)
+	}
+}
+
+func TestNewExposesPromptCacheCapabilities(t *testing.T) {
+	service, err := New(Config{Profiles: []CapabilityProfile{{
+		Provider: ProviderOpenAI,
+		Endpoint: EndpointResponses,
+		Model:    "legacy-target",
+		PromptCache: PromptCacheCapabilities{
+			Mode:                 PromptCacheOpenAILegacy,
+			InMemoryRetention:    true,
+			ExtendedRetention24h: true,
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	profile, err := service.registry.Profile(ProviderOpenAI, EndpointResponses, "legacy-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := profile.PromptCache
+	if cache.Mode != PromptCacheOpenAILegacy || !cache.InMemoryRetention || !cache.ExtendedRetention24h {
+		t.Fatalf("PromptCache = %+v, want public legacy capabilities", cache)
 	}
 }
 

@@ -1,6 +1,7 @@
 package chatcompletions
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -64,9 +65,14 @@ func EncodeResponse(response canonical.Response, options ResponseEncodeOptions) 
 		"choices": choices,
 	}
 	if response.Usage != nil {
-		value["usage"] = encodeChatUsage(*response.Usage)
-		if len(response.Usage.Extensions) > 0 {
-			diagnostics = append(diagnostics, lossyDiagnostic(options.Mode, diagnosticResponseExtensionLossy, "provider usage extensions cannot be represented by Chat Completions", "usage.extensions", mustMarshal(response.Usage.Extensions)))
+		cacheUsageDiagnostics := validateCanonicalCacheUsage(*response.Usage)
+		diagnostics = append(diagnostics, cacheUsageDiagnostics...)
+		if !canonical.HasErrors(cacheUsageDiagnostics) {
+			value["usage"] = encodeChatUsage(*response.Usage)
+		}
+		unknownExtensions := unknownUsageExtensions(response.Usage.Extensions)
+		if len(unknownExtensions) > 0 {
+			diagnostics = append(diagnostics, lossyDiagnostic(options.Mode, diagnosticResponseExtensionLossy, "provider usage extensions cannot be represented by Chat Completions", "usage.extensions", mustMarshal(unknownExtensions)))
 		}
 	}
 	if len(response.Extensions) > 0 {
@@ -191,7 +197,95 @@ func encodeChatUsage(usage canonical.Usage) map[string]any {
 	if usage.TotalTokens != nil {
 		value["total_tokens"] = *usage.TotalTokens
 	}
+	if usage.CachedInputTokens == nil && usage.CacheWriteInputTokens == nil {
+		return value
+	}
+	details := make(map[string]any)
+	if usage.CachedInputTokens != nil {
+		details["cached_tokens"] = *usage.CachedInputTokens
+	}
+	if usage.CacheWriteInputTokens != nil {
+		details["cache_write_tokens"] = *usage.CacheWriteInputTokens
+	}
+	value["prompt_tokens_details"] = details
 	return value
+}
+
+func validateCanonicalCacheUsage(usage canonical.Usage) []canonical.Diagnostic {
+	diagnostics := make([]canonical.Diagnostic, 0, 3)
+	if usage.CachedInputTokens != nil && *usage.CachedInputTokens < 0 {
+		diagnostics = append(diagnostics, diagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			"cached input token count must be a non-negative integer",
+			"usage.cached_input_tokens",
+			mustMarshal(*usage.CachedInputTokens),
+		))
+	}
+	if usage.CacheWriteInputTokens != nil && *usage.CacheWriteInputTokens < 0 {
+		diagnostics = append(diagnostics, diagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			"cache write input token count must be a non-negative integer",
+			"usage.cache_write_input_tokens",
+			mustMarshal(*usage.CacheWriteInputTokens),
+		))
+	}
+	cacheCreation, exists := usage.Extensions[canonical.UsageExtensionAnthropicCacheCreation]
+	if exists {
+		diagnostics = append(diagnostics, validateCanonicalCacheCreationBreakdown(cacheCreation)...)
+	}
+	return diagnostics
+}
+
+func validateCanonicalCacheCreationBreakdown(raw json.RawMessage) []canonical.Diagnostic {
+	path := "usage.extensions." + canonical.UsageExtensionAnthropicCacheCreation
+	object, err := canonical.DecodeObject(raw)
+	if err != nil {
+		return []canonical.Diagnostic{diagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			"cache creation breakdown must be an object",
+			path,
+			raw,
+		)}
+	}
+
+	diagnostics := make([]canonical.Diagnostic, 0, 2)
+	for _, name := range []string{"ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"} {
+		valueRaw, exists := object[name]
+		if !exists {
+			continue
+		}
+		var value int64
+		if !bytes.Equal(bytes.TrimSpace(valueRaw), []byte("null")) {
+			if err := json.Unmarshal(valueRaw, &value); err == nil && value >= 0 {
+				continue
+			}
+		}
+		diagnostics = append(diagnostics, diagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			"cache creation token count must be a non-negative integer",
+			path+"."+name,
+			valueRaw,
+		))
+	}
+	return diagnostics
+}
+
+func unknownUsageExtensions(extensions canonical.Object) canonical.Object {
+	unknown := make(canonical.Object)
+	for name, raw := range extensions {
+		if name == canonical.UsageExtensionAnthropicCacheCreation {
+			continue
+		}
+		unknown[name] = cloneRaw(raw)
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	return unknown
 }
 
 func lossyDiagnostic(mode canonical.Mode, code canonical.DiagnosticCode, message, path string, source json.RawMessage) canonical.Diagnostic {

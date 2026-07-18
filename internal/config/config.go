@@ -93,6 +93,11 @@ func Load(path string) (Config, error) {
 	if err := applyDefaultMaxOutputTokensEnvironment(&result); err != nil {
 		return Config{}, err
 	}
+	for index := range result.Transformer.Profiles {
+		if result.Transformer.Profiles[index].PromptCache.Mode == capabilities.PromptCacheUnset {
+			result.Transformer.Profiles[index].PromptCache.Mode = capabilities.PromptCacheNone
+		}
+	}
 	if err := result.Validate(); err != nil {
 		return Config{}, fmt.Errorf("validate config %q: %w", path, err)
 	}

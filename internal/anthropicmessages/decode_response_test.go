@@ -59,7 +59,13 @@ func TestDecodeResponseContentUsageAndOpaqueFields(t *testing.T) {
 		"stop_reason":"tool_use",
 		"stop_sequence":"END",
 		"stop_details":{"type":"refusal","reason":"policy"},
-		"usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":1},
+		"usage":{
+			"input_tokens":2,
+			"output_tokens":3,
+			"cache_creation_input_tokens":2,
+			"cache_read_input_tokens":1,
+			"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":0}
+		},
 		"container":{"id":"container_1"}
 	}`)
 	result := DecodeResponse(input)
@@ -80,14 +86,148 @@ func TestDecodeResponseContentUsageAndOpaqueFields(t *testing.T) {
 	if string(output.Extensions["stop_sequence"]) != `"END"` || string(output.Extensions["stop_details"]) != `{"type":"refusal","reason":"policy"}` {
 		t.Fatalf("output extensions = %#v", output.Extensions)
 	}
-	if response.Usage == nil || response.Usage.TotalTokens == nil || *response.Usage.TotalTokens != 5 {
+	if response.Usage == nil || response.Usage.InputTokens == nil || *response.Usage.InputTokens != 5 || response.Usage.TotalTokens == nil || *response.Usage.TotalTokens != 8 {
 		t.Fatalf("usage = %#v", response.Usage)
 	}
-	if string(response.Usage.Extensions["cache_read_input_tokens"]) != "1" {
-		t.Fatalf("usage extensions = %#v", response.Usage.Extensions)
+	if response.Usage.CachedInputTokens == nil || *response.Usage.CachedInputTokens != 1 || response.Usage.CacheWriteInputTokens == nil || *response.Usage.CacheWriteInputTokens != 2 {
+		t.Fatalf("usage = %#v", response.Usage)
+	}
+	assertCacheCreationBreakdown(t, response.Usage.Extensions, 2, 0)
+	if _, exists := response.Usage.Extensions["cache_read_input_tokens"]; exists {
+		t.Fatalf("consumed cache read remained in extensions = %#v", response.Usage.Extensions)
 	}
 	if _, exists := response.Extensions["container"]; !exists {
 		t.Fatalf("response extensions = %#v", response.Extensions)
+	}
+}
+
+func TestDecodeResponseCacheUsageNilZeroAndOverflow(t *testing.T) {
+	tests := []struct {
+		name      string
+		usage     string
+		wantOK    bool
+		wantInput int64
+		wantTotal int64
+		wantRead  *int64
+		wantWrite *int64
+	}{
+		{
+			name:      "cache fields omitted",
+			usage:     `{"input_tokens":2,"output_tokens":3}`,
+			wantOK:    true,
+			wantInput: 2,
+			wantTotal: 5,
+		},
+		{
+			name:      "explicit zero cache fields",
+			usage:     `{"input_tokens":2,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}`,
+			wantOK:    true,
+			wantInput: 2,
+			wantTotal: 5,
+			wantRead:  int64Pointer(0),
+			wantWrite: int64Pointer(0),
+		},
+		{
+			name:   "negative cache write",
+			usage:  `{"input_tokens":2,"output_tokens":3,"cache_creation_input_tokens":-1}`,
+			wantOK: false,
+		},
+		{
+			name:   "null cache read",
+			usage:  `{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":null}`,
+			wantOK: false,
+		},
+		{
+			name:   "input cache overflow",
+			usage:  `{"input_tokens":9223372036854775807,"output_tokens":0,"cache_read_input_tokens":1}`,
+			wantOK: false,
+		},
+		{
+			name:   "total overflow",
+			usage:  `{"input_tokens":9223372036854775807,"output_tokens":1}`,
+			wantOK: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := []byte(`{
+				"id":"msg_1","type":"message","role":"assistant","model":"claude-test",
+				"content":[],"stop_reason":"end_turn","usage":` + test.usage + `
+			}`)
+			result := DecodeResponse(input)
+			if result.OK != test.wantOK {
+				t.Fatalf("result = %#v", result)
+			}
+			if !test.wantOK {
+				if !hasDiagnostic(result.Diagnostics, canonical.DiagnosticInvalidCacheUsage) {
+					t.Fatalf("diagnostics = %#v", result.Diagnostics)
+				}
+				return
+			}
+			usage := result.Value.Usage
+			if usage == nil || usage.InputTokens == nil || *usage.InputTokens != test.wantInput || usage.TotalTokens == nil || *usage.TotalTokens != test.wantTotal {
+				t.Fatalf("usage = %#v", usage)
+			}
+			assertOptionalInt64(t, "cache read", usage.CachedInputTokens, test.wantRead)
+			assertOptionalInt64(t, "cache write", usage.CacheWriteInputTokens, test.wantWrite)
+		})
+	}
+}
+
+func TestDecodeResponseRejectsInvalidCacheCreationBreakdown(t *testing.T) {
+	tests := []struct {
+		name      string
+		breakdown string
+	}{
+		{name: "null", breakdown: `null`},
+		{name: "array", breakdown: `[]`},
+		{name: "string", breakdown: `"invalid"`},
+		{name: "five-minute null", breakdown: `{"ephemeral_5m_input_tokens":null}`},
+		{name: "five-minute negative", breakdown: `{"ephemeral_5m_input_tokens":-1}`},
+		{name: "one-hour wrong type", breakdown: `{"ephemeral_1h_input_tokens":"1"}`},
+		{name: "one-hour overflow", breakdown: `{"ephemeral_1h_input_tokens":9223372036854775808}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := []byte(`{
+				"id":"msg_1","type":"message","role":"assistant","model":"claude-test",
+				"content":[],"stop_reason":"end_turn",
+				"usage":{"input_tokens":1,"output_tokens":1,"cache_creation":` + test.breakdown + `}
+			}`)
+			result := DecodeResponse(input)
+			if result.OK || result.Value != nil || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticInvalidCacheUsage) {
+				t.Fatalf("result = %#v", result)
+			}
+		})
+	}
+}
+
+func assertOptionalInt64(t *testing.T, name string, got, want *int64) {
+	t.Helper()
+	if got == nil && want == nil {
+		return
+	}
+	if got == nil || want == nil || *got != *want {
+		t.Fatalf("%s = %v, want %v", name, got, want)
+	}
+}
+
+func int64Pointer(value int64) *int64 {
+	return &value
+}
+
+func assertCacheCreationBreakdown(t *testing.T, extensions canonical.Object, fiveMinute, oneHour int64) {
+	t.Helper()
+	var breakdown struct {
+		FiveMinute int64 `json:"ephemeral_5m_input_tokens"`
+		OneHour    int64 `json:"ephemeral_1h_input_tokens"`
+	}
+	raw := extensions[canonical.UsageExtensionAnthropicCacheCreation]
+	if err := json.Unmarshal(raw, &breakdown); err != nil {
+		t.Fatalf("decode cache creation breakdown %s: %v", raw, err)
+	}
+	if breakdown.FiveMinute != fiveMinute || breakdown.OneHour != oneHour {
+		t.Fatalf("cache creation breakdown = %#v", breakdown)
 	}
 }
 

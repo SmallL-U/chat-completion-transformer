@@ -101,3 +101,120 @@ func TestRegistryRejectsMismatchedProviderEndpoint(t *testing.T) {
 		t.Fatalf("route error = %v", err)
 	}
 }
+
+func TestRegistryValidatesPromptCacheProfiles(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile Profile
+		wantErr bool
+	}{
+		{
+			name:    "unset normalizes to none",
+			profile: Profile{Provider: ProviderOpenAI, Endpoint: EndpointResponses, Model: "openai-none"},
+		},
+		{
+			name: "anthropic direct messages",
+			profile: Profile{
+				Provider:    ProviderAnthropic,
+				Endpoint:    EndpointMessages,
+				Model:       "anthropic-cache",
+				PromptCache: PromptCacheCapabilities{Mode: PromptCacheAnthropic},
+			},
+		},
+		{
+			name: "openai legacy retention flags",
+			profile: Profile{
+				Provider: ProviderOpenAI,
+				Endpoint: EndpointResponses,
+				Model:    "openai-legacy",
+				PromptCache: PromptCacheCapabilities{
+					Mode:                 PromptCacheOpenAILegacy,
+					InMemoryRetention:    true,
+					ExtendedRetention24h: true,
+				},
+			},
+		},
+		{
+			name: "openai 5.6",
+			profile: Profile{
+				Provider:    ProviderOpenAI,
+				Endpoint:    EndpointResponses,
+				Model:       "openai-56",
+				PromptCache: PromptCacheCapabilities{Mode: PromptCacheOpenAI56},
+			},
+		},
+		{
+			name: "anthropic mode on responses",
+			profile: Profile{
+				Provider:    ProviderOpenAI,
+				Endpoint:    EndpointResponses,
+				Model:       "bad-anthropic",
+				PromptCache: PromptCacheCapabilities{Mode: PromptCacheAnthropic},
+			},
+			wantErr: true,
+		},
+		{
+			name: "anthropic cloud endpoint",
+			profile: Profile{
+				Provider:    ProviderAnthropic,
+				Endpoint:    EndpointBedrockMessages,
+				Model:       "bad-bedrock",
+				PromptCache: PromptCacheCapabilities{Mode: PromptCacheAnthropic},
+			},
+			wantErr: true,
+		},
+		{
+			name: "openai mode on messages",
+			profile: Profile{
+				Provider:    ProviderAnthropic,
+				Endpoint:    EndpointMessages,
+				Model:       "bad-openai",
+				PromptCache: PromptCacheCapabilities{Mode: PromptCacheOpenAI56},
+			},
+			wantErr: true,
+		},
+		{
+			name: "retention flags on 5.6",
+			profile: Profile{
+				Provider:    ProviderOpenAI,
+				Endpoint:    EndpointResponses,
+				Model:       "bad-flags",
+				PromptCache: PromptCacheCapabilities{Mode: PromptCacheOpenAI56, InMemoryRetention: true},
+			},
+			wantErr: true,
+		},
+		{
+			name: "unknown mode",
+			profile: Profile{
+				Provider:    ProviderOpenAI,
+				Endpoint:    EndpointResponses,
+				Model:       "bad-mode",
+				PromptCache: PromptCacheCapabilities{Mode: "future"},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			registry := NewRegistry()
+			err := registry.RegisterProfile(test.profile)
+			if test.wantErr {
+				if !errors.Is(err, ErrInvalidProfile) {
+					t.Fatalf("error = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			profile, err := registry.Profile(test.profile.Provider, test.profile.Endpoint, test.profile.Model)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.profile.PromptCache.Mode == PromptCacheUnset && profile.PromptCache.Mode != PromptCacheNone {
+				t.Fatalf("prompt cache mode = %q", profile.PromptCache.Mode)
+			}
+		})
+	}
+}

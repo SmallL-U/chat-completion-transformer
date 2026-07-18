@@ -314,6 +314,555 @@ func TestEncodeRequestUsesCallerContextForResolver(t *testing.T) {
 	}
 }
 
+func TestEncodeRequestMapsAnthropicCacheControls(t *testing.T) {
+	hour := json.RawMessage(`{"type":"ephemeral","ttl":"1h"}`)
+	fiveMinutes := json.RawMessage(`{"type":"ephemeral"}`)
+	explicitFiveMinutes := json.RawMessage(`{"type":"ephemeral","ttl":"5m"}`)
+	request := canonical.Request{
+		Turns: []canonical.Turn{
+			{
+				Kind: canonical.TurnMessage,
+				Role: canonical.RoleSystem,
+				Content: []canonical.Part{{
+					Kind:       canonical.PartText,
+					Text:       "stable system",
+					Extensions: canonical.Object{"cache_control": hour},
+				}},
+			},
+			{
+				Kind: canonical.TurnMessage,
+				Role: canonical.RoleUser,
+				Content: []canonical.Part{{
+					Kind:       canonical.PartText,
+					Text:       "stable user",
+					Extensions: canonical.Object{"cache_control": explicitFiveMinutes},
+				}},
+			},
+			{
+				Kind: canonical.TurnMessage,
+				Role: canonical.RoleAssistant,
+				Content: []canonical.Part{{
+					Kind:       canonical.PartText,
+					Text:       "stable assistant",
+					Extensions: canonical.Object{"cache_control": fiveMinutes},
+				}},
+			},
+		},
+		Tools: []canonical.ToolDefinition{{
+			Name:        "lookup",
+			InputSchema: objectSchema(),
+			Extensions:  canonical.Object{"cache_control": hour},
+		}},
+		MaxOutputTokens: intPointerValue(64),
+		Extensions:      canonical.Object{"cache_control": fiveMinutes},
+	}
+
+	result := EncodeRequest(context.Background(), request, cacheEncodeOptions())
+	if !result.OK || result.Value == nil {
+		t.Fatalf("result = %#v", result)
+	}
+	var encoded map[string]any
+	if err := json.Unmarshal(*result.Value, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	assertCacheControl(t, encoded["cache_control"], "")
+	assertCacheControl(t, encoded["tools"].([]any)[0].(map[string]any)["cache_control"], "1h")
+	assertCacheControl(t, encoded["system"].([]any)[0].(map[string]any)["cache_control"], "1h")
+	messages := encoded["messages"].([]any)
+	assertCacheControl(t, messages[0].(map[string]any)["content"].([]any)[0].(map[string]any)["cache_control"], "5m")
+	assertCacheControl(t, messages[1].(map[string]any)["content"].([]any)[0].(map[string]any)["cache_control"], "")
+}
+
+func TestEncodeRequestMapsCacheControlToUserAssets(t *testing.T) {
+	hour := json.RawMessage(`{"type":"ephemeral","ttl":"1h"}`)
+	request := canonical.Request{
+		Turns: []canonical.Turn{{
+			Kind: canonical.TurnMessage,
+			Role: canonical.RoleUser,
+			Content: []canonical.Part{
+				{
+					Kind:       canonical.PartImage,
+					Source:     &canonical.AssetSource{Kind: canonical.AssetSourceBase64, MediaType: "image/png", Data: "aA=="},
+					Extensions: canonical.Object{"cache_control": hour},
+				},
+				{
+					Kind:       canonical.PartFile,
+					Source:     &canonical.AssetSource{Kind: canonical.AssetSourceBase64, MediaType: "application/pdf", Data: "aA=="},
+					Extensions: canonical.Object{"cache_control": hour},
+				},
+			},
+		}},
+		MaxOutputTokens: intPointerValue(64),
+	}
+
+	result := EncodeRequest(context.Background(), request, cacheEncodeOptions())
+	if !result.OK || result.Value == nil {
+		t.Fatalf("result = %#v", result)
+	}
+	var encoded map[string]any
+	if err := json.Unmarshal(*result.Value, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	content := encoded["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	assertCacheControl(t, content[0].(map[string]any)["cache_control"], "1h")
+	assertCacheControl(t, content[1].(map[string]any)["cache_control"], "1h")
+}
+
+func TestEncodeRequestRejectsMalformedCacheControl(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{name: "null", raw: json.RawMessage(`null`)},
+		{name: "missing type", raw: json.RawMessage(`{}`)},
+		{name: "wrong type", raw: json.RawMessage(`{"type":"persistent"}`)},
+		{name: "empty ttl", raw: json.RawMessage(`{"type":"ephemeral","ttl":""}`)},
+		{name: "null ttl", raw: json.RawMessage(`{"type":"ephemeral","ttl":null}`)},
+		{name: "wrong ttl", raw: json.RawMessage(`{"type":"ephemeral","ttl":"2h"}`)},
+		{name: "unknown field", raw: json.RawMessage(`{"type":"ephemeral","future":true}`)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, mode := range []canonical.Mode{canonical.ModeStrict, canonical.ModeCompatible, canonical.ModeEmulate} {
+				t.Run(string(mode), func(t *testing.T) {
+					request := canonical.Request{
+						Turns:           []canonical.Turn{messageTurn(canonical.RoleUser, "hello")},
+						MaxOutputTokens: intPointerValue(64),
+						Extensions:      canonical.Object{"cache_control": test.raw},
+					}
+					options := cacheEncodeOptions()
+					options.Mode = mode
+					result := EncodeRequest(context.Background(), request, options)
+					if result.OK || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticInvalidCacheControl) {
+						t.Fatalf("result = %#v", result)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestEncodeRequestDiagnosesOpenAICacheDirectiveMismatch(t *testing.T) {
+	request := canonical.Request{
+		Turns: []canonical.Turn{{
+			Kind: canonical.TurnMessage,
+			Role: canonical.RoleUser,
+			Content: []canonical.Part{{
+				Kind:       canonical.PartText,
+				Text:       "hello",
+				Extensions: canonical.Object{"prompt_cache_breakpoint": json.RawMessage(`{"mode":"explicit"}`)},
+			}},
+		}},
+		MaxOutputTokens: intPointerValue(64),
+		Extensions: canonical.Object{
+			"prompt_cache_key":       json.RawMessage(`"stable"`),
+			"prompt_cache_options":   json.RawMessage(`{"mode":"explicit","ttl":"30m"}`),
+			"prompt_cache_retention": json.RawMessage(`"24h"`),
+		},
+	}
+
+	for _, mode := range []canonical.Mode{canonical.ModeCompatible, canonical.ModeEmulate} {
+		t.Run(string(mode), func(t *testing.T) {
+			options := cacheEncodeOptions()
+			options.Mode = mode
+			result := EncodeRequest(context.Background(), request, options)
+			if !result.OK || result.Value == nil || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticCacheControlProviderMismatch) {
+				t.Fatalf("result = %#v", result)
+			}
+			var encoded map[string]any
+			if err := json.Unmarshal(*result.Value, &encoded); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"prompt_cache_key", "prompt_cache_options", "prompt_cache_retention"} {
+				if _, exists := encoded[name]; exists {
+					t.Fatalf("encoded = %#v", encoded)
+				}
+			}
+		})
+	}
+
+	options := cacheEncodeOptions()
+	options.Mode = canonical.ModeStrict
+	result := EncodeRequest(context.Background(), request, options)
+	if result.OK || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticCacheControlProviderMismatch) {
+		t.Fatalf("strict result = %#v", result)
+	}
+}
+
+func TestEncodeRequestRejectsMalformedOpenAICacheDirectives(t *testing.T) {
+	tests := []struct {
+		name       string
+		directive  string
+		raw        json.RawMessage
+		breakpoint bool
+	}{
+		{name: "key null", directive: "prompt_cache_key", raw: json.RawMessage(`null`)},
+		{name: "key empty", directive: "prompt_cache_key", raw: json.RawMessage(`""`)},
+		{name: "key whitespace", directive: "prompt_cache_key", raw: json.RawMessage(`"  "`)},
+		{name: "key wrong type", directive: "prompt_cache_key", raw: json.RawMessage(`42`)},
+		{name: "retention null", directive: "prompt_cache_retention", raw: json.RawMessage(`null`)},
+		{name: "retention wrong enum", directive: "prompt_cache_retention", raw: json.RawMessage(`"forever"`)},
+		{name: "options null", directive: "prompt_cache_options", raw: json.RawMessage(`null`)},
+		{name: "options unknown field", directive: "prompt_cache_options", raw: json.RawMessage(`{"future":true}`)},
+		{name: "options null mode", directive: "prompt_cache_options", raw: json.RawMessage(`{"mode":null}`)},
+		{name: "options wrong mode", directive: "prompt_cache_options", raw: json.RawMessage(`{"mode":"future"}`)},
+		{name: "options wrong ttl", directive: "prompt_cache_options", raw: json.RawMessage(`{"ttl":"24h"}`)},
+		{name: "breakpoint null", directive: "prompt_cache_breakpoint", raw: json.RawMessage(`null`), breakpoint: true},
+		{name: "breakpoint missing mode", directive: "prompt_cache_breakpoint", raw: json.RawMessage(`{}`), breakpoint: true},
+		{name: "breakpoint unknown field", directive: "prompt_cache_breakpoint", raw: json.RawMessage(`{"mode":"explicit","future":true}`), breakpoint: true},
+		{name: "breakpoint null mode", directive: "prompt_cache_breakpoint", raw: json.RawMessage(`{"mode":null}`), breakpoint: true},
+		{name: "breakpoint wrong mode", directive: "prompt_cache_breakpoint", raw: json.RawMessage(`{"mode":"implicit"}`), breakpoint: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, mode := range []canonical.Mode{canonical.ModeStrict, canonical.ModeCompatible, canonical.ModeEmulate} {
+				t.Run(string(mode), func(t *testing.T) {
+					request := canonical.Request{
+						Turns:           []canonical.Turn{messageTurn(canonical.RoleUser, "hello")},
+						MaxOutputTokens: intPointerValue(64),
+					}
+					if test.breakpoint {
+						request.Turns[0].Content[0].Extensions = canonical.Object{test.directive: test.raw}
+					} else {
+						request.Extensions = canonical.Object{test.directive: test.raw}
+					}
+					options := cacheEncodeOptions()
+					options.Mode = mode
+					result := EncodeRequest(context.Background(), request, options)
+					if result.OK || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticInvalidCacheControl) {
+						t.Fatalf("result = %#v", result)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestEncodeRequestGatesAnthropicCacheControl(t *testing.T) {
+	request := canonical.Request{
+		Turns:           []canonical.Turn{messageTurn(canonical.RoleUser, "hello")},
+		MaxOutputTokens: intPointerValue(64),
+		Extensions:      canonical.Object{"cache_control": json.RawMessage(`{"type":"ephemeral"}`)},
+	}
+
+	options := testEncodeOptions()
+	result := EncodeRequest(context.Background(), request, options)
+	if !result.OK || result.Value == nil || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticCacheControlUnsupported) {
+		t.Fatalf("compatible result = %#v", result)
+	}
+	var encoded map[string]any
+	if err := json.Unmarshal(*result.Value, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := encoded["cache_control"]; exists {
+		t.Fatalf("encoded = %#v", encoded)
+	}
+
+	options.Mode = canonical.ModeStrict
+	result = EncodeRequest(context.Background(), request, options)
+	if result.OK || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticCacheControlUnsupported) {
+		t.Fatalf("strict result = %#v", result)
+	}
+
+	options = cacheEncodeOptions()
+	options.Profile.Endpoint = capabilities.EndpointBedrockMessages
+	result = EncodeRequest(context.Background(), request, options)
+	if !result.OK || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticCacheControlUnsupported) {
+		t.Fatalf("Bedrock result = %#v", result)
+	}
+}
+
+func TestEncodeRequestValidatesCacheBreakpointLimitsAndTTLOrder(t *testing.T) {
+	fiveMinutes := json.RawMessage(`{"type":"ephemeral"}`)
+	hour := json.RawMessage(`{"type":"ephemeral","ttl":"1h"}`)
+	tests := []struct {
+		name          string
+		controls      []json.RawMessage
+		automatic     json.RawMessage
+		trailingPlain bool
+		wantOK        bool
+	}{
+		{name: "four explicit", controls: []json.RawMessage{fiveMinutes, fiveMinutes, fiveMinutes, fiveMinutes}, wantOK: true},
+		{name: "five explicit", controls: []json.RawMessage{fiveMinutes, fiveMinutes, fiveMinutes, fiveMinutes, fiveMinutes}},
+		{name: "automatic plus three explicit", controls: []json.RawMessage{fiveMinutes, fiveMinutes, fiveMinutes}, automatic: fiveMinutes, trailingPlain: true, wantOK: true},
+		{name: "automatic plus four explicit", controls: []json.RawMessage{fiveMinutes, fiveMinutes, fiveMinutes, fiveMinutes}, automatic: fiveMinutes, trailingPlain: true},
+		{name: "automatic no op with four explicit", controls: []json.RawMessage{fiveMinutes, fiveMinutes, fiveMinutes, fiveMinutes}, automatic: fiveMinutes, wantOK: true},
+		{name: "automatic TTL conflict", controls: []json.RawMessage{hour}, automatic: fiveMinutes},
+		{name: "long before short", controls: []json.RawMessage{hour, fiveMinutes}, wantOK: true},
+		{name: "long after short", controls: []json.RawMessage{fiveMinutes, hour}},
+		{name: "automatic long after explicit short", controls: []json.RawMessage{fiveMinutes}, automatic: hour, trailingPlain: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parts := make([]canonical.Part, 0, len(test.controls)+1)
+			for index, control := range test.controls {
+				parts = append(parts, canonical.Part{
+					Kind:       canonical.PartText,
+					Text:       "stable-" + string(rune('a'+index)),
+					Extensions: canonical.Object{"cache_control": control},
+				})
+			}
+			if test.trailingPlain {
+				parts = append(parts, canonical.Part{Kind: canonical.PartText, Text: "latest"})
+			}
+			request := canonical.Request{
+				Turns:           []canonical.Turn{{Kind: canonical.TurnMessage, Role: canonical.RoleUser, Content: parts}},
+				MaxOutputTokens: intPointerValue(64),
+			}
+			if test.automatic != nil {
+				request.Extensions = canonical.Object{"cache_control": test.automatic}
+			}
+			result := EncodeRequest(context.Background(), request, cacheEncodeOptions())
+			if result.OK != test.wantOK {
+				t.Fatalf("result = %#v", result)
+			}
+			if !test.wantOK && !hasDiagnostic(result.Diagnostics, canonical.DiagnosticInvalidCacheControl) {
+				t.Fatalf("diagnostics = %#v", result.Diagnostics)
+			}
+		})
+	}
+}
+
+func TestEncodeRequestRejectsUnsupportedCacheBreakpointLocations(t *testing.T) {
+	control := json.RawMessage(`{"type":"ephemeral"}`)
+	request := canonical.Request{
+		Turns: []canonical.Turn{
+			messageTurn(canonical.RoleUser, "go"),
+			{
+				Kind:      canonical.TurnMessage,
+				Role:      canonical.RoleAssistant,
+				ToolCalls: []canonical.ToolCall{{ID: "call_1", Name: "lookup", ArgumentsRaw: `{}`}},
+			},
+			{
+				Kind: canonical.TurnToolResults,
+				Results: []canonical.ToolResult{{
+					CallID: "call_1",
+					Content: []canonical.Part{{
+						Kind:       canonical.PartText,
+						Text:       "done",
+						Extensions: canonical.Object{"cache_control": control},
+					}},
+				}},
+			},
+		},
+		MaxOutputTokens: intPointerValue(64),
+	}
+	result := EncodeRequest(context.Background(), request, cacheEncodeOptions())
+	if result.OK || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticCacheBreakpointUnsupported) {
+		t.Fatalf("tool result = %#v", result)
+	}
+
+	request = canonical.Request{
+		Turns: []canonical.Turn{{
+			Kind: canonical.TurnMessage,
+			Role: canonical.RoleUser,
+			Content: []canonical.Part{{
+				Kind:       canonical.PartText,
+				Text:       "",
+				Extensions: canonical.Object{"cache_control": control},
+			}},
+		}},
+		MaxOutputTokens: intPointerValue(64),
+	}
+	result = EncodeRequest(context.Background(), request, cacheEncodeOptions())
+	if result.OK || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticCacheBreakpointUnsupported) {
+		t.Fatalf("empty text = %#v", result)
+	}
+}
+
+func TestEncodeRequestRejectsCacheDirectivesAtCanonicalInvalidPositions(t *testing.T) {
+	validBreakpoint := json.RawMessage(`{"mode":"explicit"}`)
+	validControl := json.RawMessage(`{"type":"ephemeral"}`)
+	baseRequest := func() canonical.Request {
+		return canonical.Request{
+			Turns:           []canonical.Turn{messageTurn(canonical.RoleUser, "hello")},
+			MaxOutputTokens: intPointerValue(64),
+		}
+	}
+	tests := []struct {
+		name      string
+		request   func() canonical.Request
+		cacheMode capabilities.PromptCacheMode
+		code      canonical.DiagnosticCode
+	}{
+		{
+			name: "top-level OpenAI breakpoint",
+			request: func() canonical.Request {
+				request := baseRequest()
+				request.Extensions = canonical.Object{"prompt_cache_breakpoint": validBreakpoint}
+				return request
+			},
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+		{
+			name: "part top-level directive",
+			request: func() canonical.Request {
+				request := baseRequest()
+				request.Turns[0].Content[0].Extensions = canonical.Object{"prompt_cache_key": json.RawMessage(`"key"`)}
+				return request
+			},
+			code: canonical.DiagnosticInvalidCacheControl,
+		},
+		{
+			name: "tool breakpoint",
+			request: func() canonical.Request {
+				request := baseRequest()
+				request.Tools = []canonical.ToolDefinition{{
+					Name:        "lookup",
+					InputSchema: canonical.Object{},
+					Extensions:  canonical.Object{"prompt_cache_breakpoint": validBreakpoint},
+				}}
+				return request
+			},
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+		{
+			name: "assistant OpenAI breakpoint",
+			request: func() canonical.Request {
+				request := baseRequest()
+				request.Turns = append(request.Turns, canonical.Turn{
+					Kind: canonical.TurnMessage,
+					Role: canonical.RoleAssistant,
+					Content: []canonical.Part{{
+						Kind:       canonical.PartText,
+						Text:       "answer",
+						Extensions: canonical.Object{"prompt_cache_breakpoint": validBreakpoint},
+					}},
+				})
+				return request
+			},
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+		{
+			name: "tool-result cache control before capability gate",
+			request: func() canonical.Request {
+				request := baseRequest()
+				request.Turns = append(request.Turns,
+					canonical.Turn{
+						Kind:      canonical.TurnMessage,
+						Role:      canonical.RoleAssistant,
+						ToolCalls: []canonical.ToolCall{{ID: "call", Name: "lookup", ArgumentsRaw: `{}`}},
+					},
+					canonical.Turn{
+						Kind: canonical.TurnToolResults,
+						Results: []canonical.ToolResult{{
+							CallID: "call",
+							Content: []canonical.Part{{
+								Kind:       canonical.PartText,
+								Text:       "done",
+								Extensions: canonical.Object{"cache_control": validControl},
+							}},
+						}},
+					},
+				)
+				return request
+			},
+			cacheMode: capabilities.PromptCacheNone,
+			code:      canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+		{
+			name: "assistant image cache control before capability gate",
+			request: func() canonical.Request {
+				request := baseRequest()
+				request.Turns = append(request.Turns, canonical.Turn{
+					Kind: canonical.TurnMessage,
+					Role: canonical.RoleAssistant,
+					Content: []canonical.Part{{
+						Kind: canonical.PartImage,
+						Source: &canonical.AssetSource{
+							Kind: canonical.AssetSourceURL,
+							URL:  "https://example.com/image.png",
+						},
+						Extensions: canonical.Object{"cache_control": validControl},
+					}},
+				})
+				return request
+			},
+			cacheMode: capabilities.PromptCacheNone,
+			code:      canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+		{
+			name: "cache control in ignored tool-results content",
+			request: func() canonical.Request {
+				request := baseRequest()
+				request.Turns = append(request.Turns,
+					canonical.Turn{
+						Kind:      canonical.TurnMessage,
+						Role:      canonical.RoleAssistant,
+						ToolCalls: []canonical.ToolCall{{ID: "call", Name: "lookup", ArgumentsRaw: `{}`}},
+					},
+					canonical.Turn{
+						Kind: canonical.TurnToolResults,
+						Content: []canonical.Part{{
+							Kind:       canonical.PartText,
+							Text:       "ignored",
+							Extensions: canonical.Object{"cache_control": validControl},
+						}},
+						Results: []canonical.ToolResult{{CallID: "call", Content: textParts("done")}},
+					},
+				)
+				return request
+			},
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+		{
+			name: "OpenAI breakpoint in ignored message results",
+			request: func() canonical.Request {
+				request := baseRequest()
+				request.Turns[0].Results = []canonical.ToolResult{{
+					CallID: "ignored",
+					Content: []canonical.Part{{
+						Kind:       canonical.PartText,
+						Text:       "ignored",
+						Extensions: canonical.Object{"prompt_cache_breakpoint": validBreakpoint},
+					}},
+				}}
+				return request
+			},
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, mode := range []canonical.Mode{canonical.ModeStrict, canonical.ModeCompatible, canonical.ModeEmulate} {
+				t.Run(string(mode), func(t *testing.T) {
+					options := cacheEncodeOptions()
+					options.Mode = mode
+					if test.cacheMode != capabilities.PromptCacheUnset {
+						options.Profile.PromptCache.Mode = test.cacheMode
+					}
+					result := EncodeRequest(context.Background(), test.request(), options)
+					if result.OK || !hasDiagnostic(result.Diagnostics, test.code) {
+						t.Fatalf("result = %#v", result)
+					}
+				})
+			}
+		})
+	}
+}
+
+func assertCacheControl(t *testing.T, value any, ttl string) {
+	t.Helper()
+	control, ok := value.(map[string]any)
+	if !ok || control["type"] != "ephemeral" {
+		t.Fatalf("cache control = %#v", value)
+	}
+	actualTTL, exists := control["ttl"]
+	if ttl == "" && !exists {
+		return
+	}
+	if !exists || actualTTL != ttl {
+		t.Fatalf("cache control = %#v, want ttl %q", control, ttl)
+	}
+}
+
+func cacheEncodeOptions() RequestEncodeOptions {
+	options := testEncodeOptions()
+	options.Profile.PromptCache.Mode = capabilities.PromptCacheAnthropic
+	return options
+}
+
 type checkingResolver struct {
 	expected context.Context
 	called   bool

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"chat-completion-transformer/internal/canonical"
 )
@@ -168,19 +169,166 @@ func decodeResponseUsage(raw json.RawMessage, diagnostics *[]canonical.Diagnosti
 		*diagnostics = append(*diagnostics, makeDiagnostic(canonical.SeverityError, diagnosticInvalidResponse, "usage must be an object", "usage", raw))
 		return nil
 	}
-	usage := canonical.Usage{}
-	usage.InputTokens = responseInt64(takeRaw(object, "input_tokens"), "usage.input_tokens", diagnostics)
-	usage.OutputTokens = responseInt64(takeRaw(object, "output_tokens"), "usage.output_tokens", diagnostics)
-	if usage.InputTokens != nil && usage.OutputTokens != nil {
-		total := *usage.InputTokens + *usage.OutputTokens
-		usage.TotalTokens = &total
-	}
-	usage.Extensions = cloneObject(object)
+	rawInput := responseInt64(takeRaw(object, "input_tokens"), "usage.input_tokens", diagnostics)
+	output := responseInt64(takeRaw(object, "output_tokens"), "usage.output_tokens", diagnostics)
+	cacheWrite := takeCacheToken(object, "cache_creation_input_tokens", "usage.cache_creation_input_tokens", diagnostics)
+	cacheRead := takeCacheToken(object, "cache_read_input_tokens", "usage.cache_read_input_tokens", diagnostics)
+	usage := normalizeAnthropicUsage(rawInput, output, cacheWrite, cacheRead, takeUsageExtensions(object, "usage", diagnostics), "usage", diagnostics)
 	return &usage
+}
+
+func takeCacheToken(object canonical.Object, name, path string, diagnostics *[]canonical.Diagnostic) *int64 {
+	raw, exists := object[name]
+	delete(object, name)
+	if !exists {
+		return nil
+	}
+	var value int64
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		*diagnostics = append(*diagnostics, makeDiagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			"cache token count must be a non-negative integer",
+			path,
+			raw,
+		))
+		return nil
+	}
+	if err := json.Unmarshal(raw, &value); err != nil || value < 0 {
+		*diagnostics = append(*diagnostics, makeDiagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			"cache token count must be a non-negative integer",
+			path,
+			raw,
+		))
+		return nil
+	}
+	return &value
+}
+
+func takeUsageExtensions(object canonical.Object, path string, diagnostics *[]canonical.Diagnostic) canonical.Object {
+	cacheCreation, hasCacheCreation := object["cache_creation"]
+	delete(object, "cache_creation")
+	extensions := cloneObject(object)
+	if !hasCacheCreation {
+		return extensions
+	}
+	validateCacheCreationBreakdown(cacheCreation, path+".cache_creation", diagnostics)
+	if extensions == nil {
+		extensions = make(canonical.Object)
+	}
+	extensions[canonical.UsageExtensionAnthropicCacheCreation] = cloneRaw(cacheCreation)
+	return extensions
+}
+
+func validateCacheCreationBreakdown(raw json.RawMessage, path string, diagnostics *[]canonical.Diagnostic) {
+	object, err := canonical.DecodeObject(raw)
+	if err != nil {
+		*diagnostics = append(*diagnostics, makeDiagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			"cache creation breakdown must be an object",
+			path,
+			raw,
+		))
+		return
+	}
+	for _, name := range []string{"ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"} {
+		valueRaw, exists := object[name]
+		if !exists {
+			continue
+		}
+		var value int64
+		if !bytes.Equal(bytes.TrimSpace(valueRaw), []byte("null")) {
+			if err := json.Unmarshal(valueRaw, &value); err == nil && value >= 0 {
+				continue
+			}
+		}
+		*diagnostics = append(*diagnostics, makeDiagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			"cache creation token count must be a non-negative integer",
+			path+"."+name,
+			valueRaw,
+		))
+	}
+}
+
+func normalizeAnthropicUsage(
+	rawInput *int64,
+	output *int64,
+	cacheWrite *int64,
+	cacheRead *int64,
+	extensions canonical.Object,
+	path string,
+	diagnostics *[]canonical.Diagnostic,
+) canonical.Usage {
+	usage := canonical.Usage{
+		OutputTokens:          output,
+		CachedInputTokens:     cacheRead,
+		CacheWriteInputTokens: cacheWrite,
+		Extensions:            extensions,
+	}
+	if rawInput == nil {
+		return usage
+	}
+
+	input, ok := checkedTokenSum(*rawInput, pointerValue(cacheWrite), pointerValue(cacheRead))
+	if !ok {
+		*diagnostics = append(*diagnostics, makeDiagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			"input and cache token counts overflow int64",
+			path,
+			nil,
+		))
+		return usage
+	}
+	usage.InputTokens = &input
+	if output == nil {
+		return usage
+	}
+
+	total, ok := checkedTokenSum(input, *output)
+	if !ok {
+		*diagnostics = append(*diagnostics, makeDiagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			"input and output token counts overflow int64",
+			path,
+			nil,
+		))
+		return usage
+	}
+	usage.TotalTokens = &total
+	return usage
+}
+
+func pointerValue(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func checkedTokenSum(values ...int64) (int64, bool) {
+	var total int64
+	for _, value := range values {
+		if value < 0 || total > math.MaxInt64-value {
+			return 0, false
+		}
+		total += value
+	}
+	return total, true
 }
 
 func responseInt64(raw json.RawMessage, path string, diagnostics *[]canonical.Diagnostic) *int64 {
 	var value int64
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		*diagnostics = append(*diagnostics, makeDiagnostic(canonical.SeverityError, diagnosticInvalidResponse, "token count must be a non-negative integer", path, raw))
+		return nil
+	}
 	if err := json.Unmarshal(raw, &value); err != nil || value < 0 {
 		*diagnostics = append(*diagnostics, makeDiagnostic(canonical.SeverityError, diagnosticInvalidResponse, "token count must be a non-negative integer", path, raw))
 		return nil

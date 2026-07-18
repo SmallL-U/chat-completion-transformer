@@ -142,3 +142,97 @@ func TestDecodeResponseReturnsDiagnosticsForProtocolErrors(t *testing.T) {
 		assertDiagnosticCode(t, result.Diagnostics, DiagnosticInvalidResponse)
 	}
 }
+
+func TestDecodeResponseMapsPromptCacheUsageDetails(t *testing.T) {
+	result := DecodeResponse([]byte(`{
+  "id":"resp",
+  "status":"completed",
+  "output":[],
+  "usage":{
+    "input_tokens":20,
+    "output_tokens":5,
+    "total_tokens":25,
+    "input_tokens_details":{
+      "cached_tokens":12,
+      "cache_write_tokens":0,
+      "future_detail":7
+    }
+  }
+}`))
+	if !result.OK || result.Value == nil || result.Value.Usage == nil {
+		t.Fatalf("DecodeResponse() = %#v", result)
+	}
+	usage := result.Value.Usage
+	if usage.CachedInputTokens == nil || *usage.CachedInputTokens != 12 {
+		t.Fatalf("cached input tokens = %#v", usage.CachedInputTokens)
+	}
+	if usage.CacheWriteInputTokens == nil || *usage.CacheWriteInputTokens != 0 {
+		t.Fatalf("cache write input tokens = %#v", usage.CacheWriteInputTokens)
+	}
+	if usage.InputTokens == nil || *usage.InputTokens != 20 || usage.TotalTokens == nil || *usage.TotalTokens != 25 {
+		t.Fatalf("aggregate usage changed = %#v", usage)
+	}
+	details, err := canonical.DecodeObject(usage.Extensions["input_tokens_details"])
+	if err != nil || len(details) != 1 || details["future_detail"] == nil {
+		t.Fatalf("residual input token details = %s, err = %v", usage.Extensions["input_tokens_details"], err)
+	}
+}
+
+func TestDecodeResponseConsumesKnownPromptCacheUsageDetails(t *testing.T) {
+	result := DecodeResponse([]byte(`{
+  "id":"resp",
+  "status":"completed",
+  "output":[],
+  "usage":{
+    "input_tokens":3,
+    "output_tokens":2,
+    "total_tokens":5,
+    "input_tokens_details":{"cached_tokens":0}
+  }
+}`))
+	if !result.OK || result.Value == nil || result.Value.Usage == nil {
+		t.Fatalf("DecodeResponse() = %#v", result)
+	}
+	usage := result.Value.Usage
+	if usage.CachedInputTokens == nil || *usage.CachedInputTokens != 0 {
+		t.Fatalf("cached input tokens = %#v", usage.CachedInputTokens)
+	}
+	if usage.CacheWriteInputTokens != nil {
+		t.Fatalf("unreported cache write tokens = %#v", usage.CacheWriteInputTokens)
+	}
+	if _, exists := usage.Extensions["input_tokens_details"]; exists {
+		t.Fatalf("known details were retained as extensions: %#v", usage.Extensions)
+	}
+}
+
+func TestDecodeResponseRejectsInvalidPromptCacheUsage(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		details string
+	}{
+		{name: "details null", details: `null`},
+		{name: "details type", details: `[]`},
+		{name: "cached null", details: `{"cached_tokens":null}`},
+		{name: "cached type", details: `{"cached_tokens":"1"}`},
+		{name: "cached negative", details: `{"cached_tokens":-1}`},
+		{name: "write null", details: `{"cache_write_tokens":null}`},
+		{name: "write negative", details: `{"cache_write_tokens":-1}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw := `{"id":"resp","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"input_tokens_details":` + test.details + `}}`
+			result := DecodeResponse([]byte(raw))
+			if result.OK || result.Value != nil {
+				t.Fatalf("invalid cache usage unexpectedly succeeded: %#v", result)
+			}
+			assertDiagnosticCode(t, result.Diagnostics, canonical.DiagnosticInvalidCacheUsage)
+		})
+	}
+}
+
+func TestDecodeResponseRejectsNegativeAggregateUsage(t *testing.T) {
+	result := DecodeResponse([]byte(`{"id":"resp","status":"completed","output":[],"usage":{"input_tokens":-1}}`))
+	if result.OK || result.Value != nil {
+		t.Fatalf("negative aggregate usage unexpectedly succeeded: %#v", result)
+	}
+	assertDiagnosticCode(t, result.Diagnostics, DiagnosticInvalidResponse)
+}

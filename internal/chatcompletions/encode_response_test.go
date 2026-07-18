@@ -222,3 +222,144 @@ func TestEncodeResponseRejectsMissingEnvelope(t *testing.T) {
 		t.Fatalf("result = %#v", result)
 	}
 }
+
+func TestEncodeResponseWritesPromptTokenDetails(t *testing.T) {
+	model := "target-model"
+	input := int64(1200)
+	output := int64(80)
+	total := int64(1280)
+	cached := int64(900)
+	write := int64(0)
+	result := EncodeResponse(canonical.Response{
+		ID:    "response_1",
+		Model: &model,
+		Outputs: []canonical.Output{{
+			Index:        0,
+			FinishReason: canonical.FinishReasonStop,
+		}},
+		Usage: &canonical.Usage{
+			InputTokens:           &input,
+			OutputTokens:          &output,
+			TotalTokens:           &total,
+			CachedInputTokens:     &cached,
+			CacheWriteInputTokens: &write,
+			Extensions: canonical.Object{
+				canonical.UsageExtensionAnthropicCacheCreation: json.RawMessage(`{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}`),
+			},
+		},
+	}, ResponseEncodeOptions{Mode: canonical.ModeStrict, Created: 1})
+	if !result.OK || result.Value == nil || !result.Lossless {
+		t.Fatalf("result = %#v", result)
+	}
+
+	var response struct {
+		Usage struct {
+			PromptTokens        int64 `json:"prompt_tokens"`
+			CompletionTokens    int64 `json:"completion_tokens"`
+			TotalTokens         int64 `json:"total_tokens"`
+			PromptTokensDetails struct {
+				CachedTokens     *int64 `json:"cached_tokens"`
+				CacheWriteTokens *int64 `json:"cache_write_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(*result.Value, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Usage.PromptTokens != input || response.Usage.TotalTokens != total {
+		t.Fatalf("usage = %#v", response.Usage)
+	}
+	if response.Usage.PromptTokensDetails.CachedTokens == nil || *response.Usage.PromptTokensDetails.CachedTokens != cached {
+		t.Fatalf("details = %#v", response.Usage.PromptTokensDetails)
+	}
+	if response.Usage.PromptTokensDetails.CacheWriteTokens == nil || *response.Usage.PromptTokensDetails.CacheWriteTokens != 0 {
+		t.Fatalf("details = %#v", response.Usage.PromptTokensDetails)
+	}
+}
+
+func TestEncodeResponseOmitsUnreportedPromptTokenDetail(t *testing.T) {
+	model := "target-model"
+	cached := int64(0)
+	result := EncodeResponse(canonical.Response{
+		ID:      "response_1",
+		Model:   &model,
+		Outputs: []canonical.Output{{FinishReason: canonical.FinishReasonStop}},
+		Usage:   &canonical.Usage{CachedInputTokens: &cached},
+	}, ResponseEncodeOptions{Mode: canonical.ModeStrict, Created: 1})
+	if !result.OK || result.Value == nil {
+		t.Fatalf("result = %#v", result)
+	}
+	var response struct {
+		Usage struct {
+			Details map[string]json.RawMessage `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(*result.Value, &response); err != nil {
+		t.Fatal(err)
+	}
+	if string(response.Usage.Details["cached_tokens"]) != "0" {
+		t.Fatalf("details = %#v", response.Usage.Details)
+	}
+	if _, exists := response.Usage.Details["cache_write_tokens"]; exists {
+		t.Fatalf("details = %#v", response.Usage.Details)
+	}
+}
+
+func TestEncodeResponseRejectsInvalidPromptCacheDetails(t *testing.T) {
+	negative := int64(-1)
+	tests := []struct {
+		name  string
+		usage canonical.Usage
+	}{
+		{name: "cached input", usage: canonical.Usage{CachedInputTokens: &negative}},
+		{name: "cache write", usage: canonical.Usage{CacheWriteInputTokens: &negative}},
+		{name: "null cache creation breakdown", usage: canonical.Usage{Extensions: canonical.Object{
+			canonical.UsageExtensionAnthropicCacheCreation: json.RawMessage(`null`),
+		}}},
+		{name: "negative cache creation breakdown", usage: canonical.Usage{Extensions: canonical.Object{
+			canonical.UsageExtensionAnthropicCacheCreation: json.RawMessage(`{"ephemeral_5m_input_tokens":-1}`),
+		}}},
+		{name: "wrong cache creation breakdown type", usage: canonical.Usage{Extensions: canonical.Object{
+			canonical.UsageExtensionAnthropicCacheCreation: json.RawMessage(`{"ephemeral_1h_input_tokens":"1"}`),
+		}}},
+		{name: "overflowing cache creation breakdown", usage: canonical.Usage{Extensions: canonical.Object{
+			canonical.UsageExtensionAnthropicCacheCreation: json.RawMessage(`{"ephemeral_1h_input_tokens":9223372036854775808}`),
+		}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, mode := range []canonical.Mode{canonical.ModeStrict, canonical.ModeCompatible, canonical.ModeEmulate} {
+				t.Run(string(mode), func(t *testing.T) {
+					model := "model"
+					result := EncodeResponse(canonical.Response{
+						ID:    "response",
+						Model: &model,
+						Outputs: []canonical.Output{{
+							Index:        0,
+							FinishReason: canonical.FinishReasonStop,
+						}},
+						Usage: &test.usage,
+					}, ResponseEncodeOptions{Mode: mode})
+					if result.OK || result.Value != nil || !containsDiagnostic(result.Diagnostics, canonical.DiagnosticInvalidCacheUsage) {
+						t.Fatalf("result = %#v", result)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestEncodeResponseStillRejectsUnknownUsageExtensionsInStrictMode(t *testing.T) {
+	model := "target-model"
+	result := EncodeResponse(canonical.Response{
+		ID:      "response_1",
+		Model:   &model,
+		Outputs: []canonical.Output{{FinishReason: canonical.FinishReasonStop}},
+		Usage: &canonical.Usage{Extensions: canonical.Object{
+			"future_usage": json.RawMessage(`true`),
+		}},
+	}, ResponseEncodeOptions{Mode: canonical.ModeStrict, Created: 1})
+	if result.OK || !containsDiagnostic(result.Diagnostics, diagnosticResponseExtensionLossy) {
+		t.Fatalf("result = %#v", result)
+	}
+}

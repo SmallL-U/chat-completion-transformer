@@ -18,6 +18,14 @@ const (
 	diagnosticContentFieldPreserved canonical.DiagnosticCode = "content_field_preserved"
 )
 
+var cacheDirectiveNames = [...]string{
+	"cache_control",
+	"prompt_cache_key",
+	"prompt_cache_options",
+	"prompt_cache_retention",
+	"prompt_cache_breakpoint",
+}
+
 // DecodeRequest validates an untrusted Chat Completions request and normalizes
 // it into the provider-independent representation.
 func DecodeRequest(input []byte) canonical.Result[canonical.Request] {
@@ -52,6 +60,14 @@ func DecodeRequest(input []byte) canonical.Result[canonical.Request] {
 		diagnostics = append(diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "stream_options requires stream to be true", "stream_options", streamOptionsRaw))
 	}
 	request.Metadata = decodeMetadata(take(object, "metadata"), &diagnostics)
+	cacheExtensions := takeExtensions(
+		object,
+		"cache_control",
+		"prompt_cache_key",
+		"prompt_cache_options",
+		"prompt_cache_retention",
+	)
+	rejectCacheDirectives(object, "", &diagnostics)
 
 	if request.CandidateCount != nil && *request.CandidateCount < 1 {
 		diagnostics = append(diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "n must be at least 1", "n", nil))
@@ -73,6 +89,9 @@ func DecodeRequest(input []byte) canonical.Result[canonical.Request] {
 			raw,
 		))
 	}
+	for name, raw := range cacheExtensions {
+		request.Extensions[name] = raw
+	}
 
 	return canonical.Success(request, diagnostics)
 }
@@ -89,6 +108,7 @@ func decodeStreamOptions(raw json.RawMessage, diagnostics *[]canonical.Diagnosti
 	}
 
 	includeUsage := optional[bool](take(object, "include_usage"), "stream_options.include_usage", diagnostics)
+	rejectCacheDirectives(object, "stream_options", diagnostics)
 	return includeUsage != nil && *includeUsage, object
 }
 
@@ -161,6 +181,7 @@ func decodeMessage(raw json.RawMessage, index int, diagnostics *[]canonical.Diag
 		Content: decodeContent(take(object, "content"), path+".content", diagnostics),
 		Name:    optional[string](take(object, "name"), path+".name", diagnostics),
 	}
+	rejectCacheDirectives(object, path, diagnostics)
 
 	hasAssistantAlternative := false
 	if role == canonical.RoleAssistant {
@@ -195,6 +216,7 @@ func decodeToolResult(raw json.RawMessage, index int, diagnostics *[]canonical.D
 		CallID:  requiredString(take(object, "tool_call_id"), path+".tool_call_id", diagnostics),
 		Content: decodeContent(take(object, "content"), path+".content", diagnostics),
 	}
+	rejectCacheDirectives(object, path, diagnostics)
 	if len(result.Content) == 0 {
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "tool message content is required", path+".content", nil))
 	}
@@ -256,9 +278,13 @@ func decodeContentBlock(raw json.RawMessage, path string, diagnostics *[]canonic
 	case "file":
 		part, nestedFields = decodeFilePart(take(object, "file"), path+".file", raw, diagnostics)
 	default:
+		rejectCacheDirectives(object, path, diagnostics)
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityWarning, canonical.DiagnosticUnsupportedContentPart, fmt.Sprintf("content part type %q is preserved as opaque", typeName), path, raw))
 		return []canonical.Part{opaqueChatPart(raw)}
 	}
+	cacheExtensions := takeExtensions(object, "cache_control", "prompt_cache_breakpoint")
+	rejectCacheDirectives(object, path, diagnostics)
+	part.Extensions = cacheExtensions
 
 	if part.Kind == canonical.PartOpaque || (!nestedFields && len(object) == 0) {
 		return []canonical.Part{part}
@@ -274,6 +300,7 @@ func decodeImagePart(raw json.RawMessage, path string, original json.RawMessage,
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "image_url must be an object", path, raw))
 		return opaqueChatPart(original), false
 	}
+	rejectCacheDirectives(object, path, diagnostics)
 
 	value := requiredString(take(object, "url"), path+".url", diagnostics)
 	source := canonical.AssetSource{Kind: canonical.AssetSourceURL, URL: value}
@@ -299,6 +326,7 @@ func decodeAudioPart(raw json.RawMessage, path string, original json.RawMessage,
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "input_audio must be an object", path, raw))
 		return opaqueChatPart(original), false
 	}
+	rejectCacheDirectives(object, path, diagnostics)
 
 	data := requiredString(take(object, "data"), path+".data", diagnostics)
 	format := requiredString(take(object, "format"), path+".format", diagnostics)
@@ -316,6 +344,7 @@ func decodeFilePart(raw json.RawMessage, path string, original json.RawMessage, 
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "file must be an object", path, raw))
 		return opaqueChatPart(original), false
 	}
+	rejectCacheDirectives(object, path, diagnostics)
 
 	part := canonical.Part{Kind: canonical.PartFile}
 	part.Filename = optional[string](take(object, "filename"), path+".filename", diagnostics)
@@ -355,6 +384,7 @@ func decodeToolCalls(raw json.RawMessage, path string, content []canonical.Part,
 			*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "tool call must be an object", callPath, value))
 			continue
 		}
+		rejectCacheDirectives(object, callPath, diagnostics)
 		typeName := requiredString(take(object, "type"), callPath+".type", diagnostics)
 		if typeName != "function" {
 			content = append(content, canonical.Part{Kind: canonical.PartOpaque, Provider: "chat_completions.tool_call", Value: cloneRaw(value)})
@@ -369,6 +399,7 @@ func decodeToolCalls(raw json.RawMessage, path string, content []canonical.Part,
 			*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "function tool call is malformed", callPath+".function", functionRaw))
 			continue
 		}
+		rejectCacheDirectives(function, callPath+".function", diagnostics)
 		name := requiredString(take(function, "name"), callPath+".function.name", diagnostics)
 		arguments := requiredString(take(function, "arguments"), callPath+".function.arguments", diagnostics)
 		calls = append(calls, canonical.ToolCall{
@@ -410,18 +441,22 @@ func decodeTools(raw json.RawMessage, extensions canonical.Object, diagnostics *
 		}
 		typeName := requiredString(take(object, "type"), path+".type", diagnostics)
 		if typeName != "function" {
+			rejectCacheDirectives(object, path, diagnostics)
 			preserveRaw = true
 			unsupported = append(unsupported, cloneRaw(value))
 			*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityWarning, diagnosticUnsupportedToolType, fmt.Sprintf("tool type %q cannot be represented as a canonical function tool", typeName), path, value))
 			continue
 		}
 
+		cacheExtensions := takeExtensions(object, "cache_control")
+		rejectCacheDirectives(object, path, diagnostics)
 		functionRaw := take(object, "function")
 		function, err := canonical.DecodeObject(functionRaw)
 		if err != nil {
 			*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "function tool is malformed", path+".function", functionRaw))
 			continue
 		}
+		rejectCacheDirectives(function, path+".function", diagnostics)
 		schema := defaultInputSchema()
 		if parameters := take(function, "parameters"); len(bytes.TrimSpace(parameters)) > 0 && !bytes.Equal(bytes.TrimSpace(parameters), []byte("null")) {
 			schema, err = canonical.DecodeObject(parameters)
@@ -435,6 +470,7 @@ func decodeTools(raw json.RawMessage, extensions canonical.Object, diagnostics *
 			Description: optional[string](take(function, "description"), path+".function.description", diagnostics),
 			InputSchema: schema,
 			Strict:      optional[bool](take(function, "strict"), path+".function.strict", diagnostics),
+			Extensions:  cacheExtensions,
 		})
 		if len(object) > 0 || len(function) > 0 {
 			preserveRaw = true
@@ -475,6 +511,7 @@ func decodeToolChoice(raw json.RawMessage, extensions canonical.Object, diagnost
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "tool_choice must be a string or object", "tool_choice", raw))
 		return nil
 	}
+	rejectCacheDirectives(object, "tool_choice", diagnostics)
 	typeRaw := take(object, "type")
 	if requiredString(typeRaw, "tool_choice.type", diagnostics) != "function" {
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "only named function tool_choice is supported", "tool_choice.type", typeRaw))
@@ -486,6 +523,7 @@ func decodeToolChoice(raw json.RawMessage, extensions canonical.Object, diagnost
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "tool_choice.function must be an object", "tool_choice.function", functionRaw))
 		return nil
 	}
+	rejectCacheDirectives(function, "tool_choice.function", diagnostics)
 	name := requiredString(take(function, "name"), "tool_choice.function.name", diagnostics)
 	if len(object) > 0 || len(function) > 0 {
 		extensions["tool_choice"] = cloneRaw(raw)
@@ -502,6 +540,7 @@ func decodeOutputFormat(raw json.RawMessage, extensions canonical.Object, diagno
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "response_format must be an object", "response_format", raw))
 		return nil
 	}
+	rejectCacheDirectives(object, "response_format", diagnostics)
 	typeRaw := take(object, "type")
 	typeName := requiredString(typeRaw, "response_format.type", diagnostics)
 	format := &canonical.OutputFormat{Type: canonical.OutputFormatType(typeName)}
@@ -518,6 +557,7 @@ func decodeOutputFormat(raw json.RawMessage, extensions canonical.Object, diagno
 			*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "response_format.json_schema must be an object", "response_format.json_schema", schemaConfigRaw))
 			return format
 		}
+		rejectCacheDirectives(schemaConfig, "response_format.json_schema", diagnostics)
 		name := requiredString(take(schemaConfig, "name"), "response_format.json_schema.name", diagnostics)
 		format.Name = &name
 		format.Description = optional[string](take(schemaConfig, "description"), "response_format.json_schema.description", diagnostics)
@@ -646,6 +686,47 @@ func take(object canonical.Object, key string) json.RawMessage {
 	value := object[key]
 	delete(object, key)
 	return value
+}
+
+func takeExtensions(object canonical.Object, names ...string) canonical.Object {
+	var extensions canonical.Object
+	for _, name := range names {
+		raw, exists := object[name]
+		if !exists {
+			continue
+		}
+		delete(object, name)
+		if extensions == nil {
+			extensions = make(canonical.Object)
+		}
+		extensions[name] = cloneRaw(raw)
+	}
+	return extensions
+}
+
+func rejectCacheDirectives(object canonical.Object, path string, diagnostics *[]canonical.Diagnostic) {
+	for _, name := range cacheDirectiveNames {
+		raw, exists := object[name]
+		if !exists {
+			continue
+		}
+		delete(object, name)
+		fieldPath := name
+		if path != "" {
+			fieldPath = path + "." + name
+		}
+		code := canonical.DiagnosticInvalidCacheControl
+		if name == "prompt_cache_breakpoint" {
+			code = canonical.DiagnosticCacheBreakpointUnsupported
+		}
+		*diagnostics = append(*diagnostics, diagnostic(
+			canonical.SeverityError,
+			code,
+			fmt.Sprintf("cache directive %q is not valid at %s", name, fieldPath),
+			fieldPath,
+			raw,
+		))
+	}
 }
 
 func opaqueChatPart(raw json.RawMessage) canonical.Part {

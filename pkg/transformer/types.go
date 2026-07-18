@@ -8,42 +8,44 @@ import (
 )
 
 type (
-	Object              = canonical.Object
-	Role                = canonical.Role
-	AssetSourceKind     = canonical.AssetSourceKind
-	AssetSource         = canonical.AssetSource
-	ImageDetail         = canonical.ImageDetail
-	PartKind            = canonical.PartKind
-	Part                = canonical.Part
-	ToolCall            = canonical.ToolCall
-	ToolResult          = canonical.ToolResult
-	TurnKind            = canonical.TurnKind
-	Turn                = canonical.Turn
-	ToolDefinition      = canonical.ToolDefinition
-	ToolChoiceMode      = canonical.ToolChoiceMode
-	ToolChoice          = canonical.ToolChoice
-	OutputFormatType    = canonical.OutputFormatType
-	OutputFormat        = canonical.OutputFormat
-	CanonicalRequest    = canonical.Request
-	Usage               = canonical.Usage
-	FinishReason        = canonical.FinishReason
-	Output              = canonical.Output
-	CanonicalResponse   = canonical.Response
-	EventType           = canonical.EventType
-	CanonicalEvent      = canonical.Event
-	Mode                = canonical.Mode
-	Severity            = canonical.Severity
-	DiagnosticCode      = canonical.DiagnosticCode
-	Diagnostic          = canonical.Diagnostic
-	CapabilityProfile   = capabilities.Profile
-	ImageCapabilities   = capabilities.ImageCapabilities
-	ContentCapabilities = capabilities.ContentCapabilities
-	ModelRoute          = capabilities.ModelRoute
-	Provider            = capabilities.Provider
-	Endpoint            = capabilities.Endpoint
-	AssetResolver       = assets.Resolver
-	ResolvedAsset       = assets.ResolvedAsset
-	NativeAssetResolver = assets.NativeResolver
+	Object                  = canonical.Object
+	Role                    = canonical.Role
+	AssetSourceKind         = canonical.AssetSourceKind
+	AssetSource             = canonical.AssetSource
+	ImageDetail             = canonical.ImageDetail
+	PartKind                = canonical.PartKind
+	Part                    = canonical.Part
+	ToolCall                = canonical.ToolCall
+	ToolResult              = canonical.ToolResult
+	TurnKind                = canonical.TurnKind
+	Turn                    = canonical.Turn
+	ToolDefinition          = canonical.ToolDefinition
+	ToolChoiceMode          = canonical.ToolChoiceMode
+	ToolChoice              = canonical.ToolChoice
+	OutputFormatType        = canonical.OutputFormatType
+	OutputFormat            = canonical.OutputFormat
+	CanonicalRequest        = canonical.Request
+	Usage                   = canonical.Usage
+	FinishReason            = canonical.FinishReason
+	Output                  = canonical.Output
+	CanonicalResponse       = canonical.Response
+	EventType               = canonical.EventType
+	CanonicalEvent          = canonical.Event
+	Mode                    = canonical.Mode
+	Severity                = canonical.Severity
+	DiagnosticCode          = canonical.DiagnosticCode
+	Diagnostic              = canonical.Diagnostic
+	CapabilityProfile       = capabilities.Profile
+	ImageCapabilities       = capabilities.ImageCapabilities
+	ContentCapabilities     = capabilities.ContentCapabilities
+	PromptCacheMode         = capabilities.PromptCacheMode
+	PromptCacheCapabilities = capabilities.PromptCacheCapabilities
+	ModelRoute              = capabilities.ModelRoute
+	Provider                = capabilities.Provider
+	Endpoint                = capabilities.Endpoint
+	AssetResolver           = assets.Resolver
+	ResolvedAsset           = assets.ResolvedAsset
+	NativeAssetResolver     = assets.NativeResolver
 )
 
 type Result[T any] = canonical.Result[T]
@@ -121,9 +123,21 @@ const (
 	DiagnosticSamplingParameterUnsupported     = canonical.DiagnosticSamplingParameterUnsupported
 	DiagnosticResponseFormatLossy              = canonical.DiagnosticResponseFormatLossy
 	DiagnosticModelMappingMissing              = canonical.DiagnosticModelMappingMissing
+	DiagnosticInvalidCacheControl              = canonical.DiagnosticInvalidCacheControl
+	DiagnosticCacheControlUnsupported          = canonical.DiagnosticCacheControlUnsupported
+	DiagnosticCacheControlProviderMismatch     = canonical.DiagnosticCacheControlProviderMismatch
+	DiagnosticCacheBreakpointUnsupported       = canonical.DiagnosticCacheBreakpointUnsupported
+	DiagnosticInvalidCacheUsage                = canonical.DiagnosticInvalidCacheUsage
+	UsageExtensionAnthropicCacheCreation       = canonical.UsageExtensionAnthropicCacheCreation
 
 	ProviderOpenAI    = capabilities.ProviderOpenAI
 	ProviderAnthropic = capabilities.ProviderAnthropic
+
+	PromptCacheUnset        = capabilities.PromptCacheUnset
+	PromptCacheNone         = capabilities.PromptCacheNone
+	PromptCacheAnthropic    = capabilities.PromptCacheAnthropic
+	PromptCacheOpenAILegacy = capabilities.PromptCacheOpenAILegacy
+	PromptCacheOpenAI56     = capabilities.PromptCacheOpenAI56
 
 	EndpointResponses       = capabilities.EndpointResponses
 	EndpointMessages        = capabilities.EndpointMessages

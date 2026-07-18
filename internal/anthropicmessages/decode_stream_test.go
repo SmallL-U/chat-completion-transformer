@@ -45,9 +45,13 @@ func TestStreamDecoderReassemblesEveryToolArgumentSplit(t *testing.T) {
 		if starts != 1 || ends != 1 || joined.String() != arguments {
 			t.Fatalf("split %d: starts=%d ends=%d arguments=%q", split, starts, ends, joined.String())
 		}
-		if lastUsage == nil || lastUsage.TotalTokens == nil || *lastUsage.TotalTokens != 6 {
+		if lastUsage == nil || lastUsage.InputTokens == nil || *lastUsage.InputTokens != 6 || lastUsage.TotalTokens == nil || *lastUsage.TotalTokens != 10 {
 			t.Fatalf("split %d usage = %#v", split, lastUsage)
 		}
+		if lastUsage.CachedInputTokens == nil || *lastUsage.CachedInputTokens != 1 || lastUsage.CacheWriteInputTokens == nil || *lastUsage.CacheWriteInputTokens != 3 {
+			t.Fatalf("split %d cache usage = %#v", split, lastUsage)
+		}
+		assertCacheCreationBreakdown(t, lastUsage.Extensions, 3, 0)
 		if finish == nil || finish.Reason == nil || *finish.Reason != canonical.FinishReasonToolCalls || finish.ProviderReason == nil || *finish.ProviderReason != "tool_use" {
 			t.Fatalf("split %d finish = %#v", split, finish)
 		}
@@ -222,8 +226,159 @@ func TestStreamDecoderPingErrorAndTruncation(t *testing.T) {
 	}
 }
 
+func TestStreamDecoderPreservesExplicitZeroCacheUsage(t *testing.T) {
+	stream := append([]byte{}, messageStartFrameWithUsage(map[string]any{
+		"input_tokens": 2, "output_tokens": 0,
+		"cache_creation_input_tokens": 0,
+		"cache_read_input_tokens":     0,
+	})...)
+	stream = append(stream, sseJSON(map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
+		"usage": map[string]any{"output_tokens": 1},
+	})...)
+	stream = append(stream, sseJSON(map[string]any{"type": "message_stop"})...)
+
+	decoder := NewStreamDecoder(0)
+	result := decoder.Feed(stream)
+	if !result.OK || result.Value == nil {
+		t.Fatalf("result = %#v", result)
+	}
+	var lastUsage *canonical.Usage
+	for _, event := range *result.Value {
+		if event.Type == canonical.EventUsage {
+			lastUsage = event.Usage
+		}
+	}
+	if lastUsage == nil || lastUsage.CachedInputTokens == nil || *lastUsage.CachedInputTokens != 0 || lastUsage.CacheWriteInputTokens == nil || *lastUsage.CacheWriteInputTokens != 0 {
+		t.Fatalf("usage = %#v", lastUsage)
+	}
+}
+
+func TestStreamDecoderUsageEventsDoNotExposeInternalState(t *testing.T) {
+	decoder := NewStreamDecoder(0)
+	start := decoder.Feed(messageStartFrameWithUsage(map[string]any{
+		"input_tokens":                2,
+		"output_tokens":               0,
+		"cache_creation_input_tokens": 3,
+		"cache_read_input_tokens":     1,
+		"cache_creation": map[string]any{
+			"ephemeral_5m_input_tokens": 3,
+		},
+	}))
+	if !start.OK || start.Value == nil {
+		t.Fatalf("start = %#v", start)
+	}
+	var exposed *canonical.Usage
+	for _, event := range *start.Value {
+		if event.Type == canonical.EventUsage {
+			exposed = event.Usage
+		}
+	}
+	if exposed == nil {
+		t.Fatalf("events = %#v", *start.Value)
+	}
+	*exposed.InputTokens = -1
+	*exposed.OutputTokens = -1
+	*exposed.TotalTokens = -1
+	*exposed.CachedInputTokens = -1
+	*exposed.CacheWriteInputTokens = -1
+	exposed.Extensions[canonical.UsageExtensionAnthropicCacheCreation] = json.RawMessage(`null`)
+
+	result := decoder.Feed(sseJSON(map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
+		"usage": map[string]any{"output_tokens": 1},
+	}))
+	if !result.OK || result.Value == nil {
+		t.Fatalf("delta = %#v", result)
+	}
+	var merged *canonical.Usage
+	for _, event := range *result.Value {
+		if event.Type == canonical.EventUsage {
+			merged = event.Usage
+		}
+	}
+	if merged == nil || merged.InputTokens == nil || *merged.InputTokens != 6 ||
+		merged.OutputTokens == nil || *merged.OutputTokens != 1 ||
+		merged.TotalTokens == nil || *merged.TotalTokens != 7 ||
+		merged.CachedInputTokens == nil || *merged.CachedInputTokens != 1 ||
+		merged.CacheWriteInputTokens == nil || *merged.CacheWriteInputTokens != 3 {
+		t.Fatalf("merged usage = %#v", merged)
+	}
+	if string(merged.Extensions[canonical.UsageExtensionAnthropicCacheCreation]) == "null" {
+		t.Fatalf("merged extensions = %#v", merged.Extensions)
+	}
+}
+
+func TestStreamDecoderRejectsInvalidCacheCreationBreakdown(t *testing.T) {
+	tests := []struct {
+		name      string
+		breakdown any
+	}{
+		{name: "null", breakdown: nil},
+		{name: "array", breakdown: []any{}},
+		{name: "string", breakdown: "invalid"},
+		{name: "five-minute null", breakdown: map[string]any{"ephemeral_5m_input_tokens": nil}},
+		{name: "five-minute negative", breakdown: map[string]any{"ephemeral_5m_input_tokens": -1}},
+		{name: "one-hour wrong type", breakdown: map[string]any{"ephemeral_1h_input_tokens": "1"}},
+		{name: "one-hour overflow", breakdown: map[string]any{"ephemeral_1h_input_tokens": uint64(9223372036854775808)}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			decoder := NewStreamDecoder(0)
+			result := decoder.Feed(messageStartFrameWithUsage(map[string]any{
+				"input_tokens":   1,
+				"output_tokens":  0,
+				"cache_creation": test.breakdown,
+			}))
+			if result.OK || result.Value != nil || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticInvalidCacheUsage) {
+				t.Fatalf("result = %#v", result)
+			}
+		})
+	}
+}
+
+func TestStreamDecoderRejectsCacheAndTotalOverflow(t *testing.T) {
+	decoder := NewStreamDecoder(0)
+	result := decoder.Feed(messageStartFrameWithUsage(map[string]any{
+		"input_tokens":            int64(9223372036854775807),
+		"output_tokens":           0,
+		"cache_read_input_tokens": 1,
+	}))
+	if result.OK || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticInvalidCacheUsage) {
+		t.Fatalf("cache overflow = %#v", result)
+	}
+
+	decoder = NewStreamDecoder(0)
+	result = decoder.Feed(messageStartFrameWithUsage(map[string]any{
+		"input_tokens":  int64(9223372036854775807),
+		"output_tokens": 0,
+	}))
+	if !result.OK {
+		t.Fatalf("start = %#v", result)
+	}
+	result = decoder.Feed(sseJSON(map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
+		"usage": map[string]any{"output_tokens": 1},
+	}))
+	if result.OK || !hasDiagnostic(result.Diagnostics, canonical.DiagnosticInvalidCacheUsage) {
+		t.Fatalf("total overflow = %#v", result)
+	}
+}
+
 func toolStream(first, second string) []byte {
-	stream := append([]byte{}, messageStartFrame()...)
+	stream := append([]byte{}, messageStartFrameWithUsage(map[string]any{
+		"input_tokens":                2,
+		"output_tokens":               0,
+		"cache_creation_input_tokens": 3,
+		"cache_read_input_tokens":     1,
+		"cache_creation": map[string]any{
+			"ephemeral_5m_input_tokens": 3,
+			"ephemeral_1h_input_tokens": 0,
+		},
+	})...)
 	stream = append(stream, sseJSON(map[string]any{"type": "ping"})...)
 	stream = append(stream, sseJSON(map[string]any{
 		"type":          "content_block_start",
@@ -245,7 +400,7 @@ func toolStream(first, second string) []byte {
 			"stop_sequence": nil,
 			"stop_details":  map[string]any{"kind": "tool"},
 		},
-		"usage": map[string]any{"output_tokens": 4, "cache_read_input_tokens": 1},
+		"usage": map[string]any{"output_tokens": 4},
 	})...)
 	stream = append(stream, sseJSON(map[string]any{"type": "message_stop"})...)
 	return stream
@@ -274,12 +429,16 @@ func textStream() []byte {
 }
 
 func messageStartFrame() []byte {
+	return messageStartFrameWithUsage(map[string]any{"input_tokens": 2, "output_tokens": 0})
+}
+
+func messageStartFrameWithUsage(usage map[string]any) []byte {
 	return sseJSON(map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
 			"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-test",
 			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-			"usage": map[string]any{"input_tokens": 2, "output_tokens": 0},
+			"usage": usage,
 		},
 	})
 }

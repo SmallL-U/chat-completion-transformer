@@ -172,9 +172,9 @@ func (d *StreamDecoder) decodeMessageStart(object canonical.Object, raw json.Raw
 	delete(message, "usage")
 	if hasUsage {
 		usage := decodeStreamUsage(usageRaw, "message.usage", &diagnostics)
-		if usage != nil {
-			d.mergeUsage(*usage)
-			copy := d.usage
+		if usage != nil && !canonical.HasErrors(diagnostics) {
+			d.mergeUsage(*usage, "message.usage", &diagnostics)
+			copy := cloneStreamUsage(d.usage)
 			events = append(events, canonical.Event{Type: canonical.EventUsage, Usage: &copy})
 		}
 	}
@@ -338,9 +338,9 @@ func (d *StreamDecoder) decodeMessageDelta(object canonical.Object, raw json.Raw
 	delete(object, "usage")
 	if hasUsage {
 		usage := decodeStreamUsage(usageRaw, "usage", &diagnostics)
-		if usage != nil {
-			d.mergeUsage(*usage)
-			copy := d.usage
+		if usage != nil && !canonical.HasErrors(diagnostics) {
+			d.mergeUsage(*usage, "usage", &diagnostics)
+			copy := cloneStreamUsage(d.usage)
 			events = append(events, canonical.Event{Type: canonical.EventUsage, Usage: &copy})
 		}
 	}
@@ -436,25 +436,28 @@ func decodeStreamUsage(raw json.RawMessage, path string, diagnostics *[]canonica
 		*diagnostics = append(*diagnostics, makeDiagnostic(canonical.SeverityError, diagnosticInvalidStreamJSON, "usage must be an object", path, raw))
 		return nil
 	}
-	usage := canonical.Usage{}
+	var rawInput *int64
 	if inputRaw, exists := object["input_tokens"]; exists {
 		delete(object, "input_tokens")
-		usage.InputTokens = streamTokenCount(inputRaw, path+".input_tokens", diagnostics)
+		rawInput = streamTokenCount(inputRaw, path+".input_tokens", diagnostics)
 	}
+	var output *int64
 	if outputRaw, exists := object["output_tokens"]; exists {
 		delete(object, "output_tokens")
-		usage.OutputTokens = streamTokenCount(outputRaw, path+".output_tokens", diagnostics)
+		output = streamTokenCount(outputRaw, path+".output_tokens", diagnostics)
 	}
-	if usage.InputTokens != nil && usage.OutputTokens != nil {
-		total := *usage.InputTokens + *usage.OutputTokens
-		usage.TotalTokens = &total
-	}
-	usage.Extensions = cloneObject(object)
+	cacheWrite := takeCacheToken(object, "cache_creation_input_tokens", path+".cache_creation_input_tokens", diagnostics)
+	cacheRead := takeCacheToken(object, "cache_read_input_tokens", path+".cache_read_input_tokens", diagnostics)
+	usage := normalizeAnthropicUsage(rawInput, output, cacheWrite, cacheRead, takeUsageExtensions(object, path, diagnostics), path, diagnostics)
 	return &usage
 }
 
 func streamTokenCount(raw json.RawMessage, path string, diagnostics *[]canonical.Diagnostic) *int64 {
 	var value int64
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		*diagnostics = append(*diagnostics, makeDiagnostic(canonical.SeverityError, diagnosticInvalidStreamJSON, "token count must be a non-negative integer", path, raw))
+		return nil
+	}
 	if err := json.Unmarshal(raw, &value); err != nil || value < 0 {
 		*diagnostics = append(*diagnostics, makeDiagnostic(canonical.SeverityError, diagnosticInvalidStreamJSON, "token count must be a non-negative integer", path, raw))
 		return nil
@@ -462,12 +465,18 @@ func streamTokenCount(raw json.RawMessage, path string, diagnostics *[]canonical
 	return &value
 }
 
-func (d *StreamDecoder) mergeUsage(next canonical.Usage) {
+func (d *StreamDecoder) mergeUsage(next canonical.Usage, path string, diagnostics *[]canonical.Diagnostic) {
 	if next.InputTokens != nil {
 		d.usage.InputTokens = next.InputTokens
 	}
 	if next.OutputTokens != nil {
 		d.usage.OutputTokens = next.OutputTokens
+	}
+	if next.CachedInputTokens != nil {
+		d.usage.CachedInputTokens = next.CachedInputTokens
+	}
+	if next.CacheWriteInputTokens != nil {
+		d.usage.CacheWriteInputTokens = next.CacheWriteInputTokens
 	}
 	if len(next.Extensions) > 0 {
 		if d.usage.Extensions == nil {
@@ -478,9 +487,38 @@ func (d *StreamDecoder) mergeUsage(next canonical.Usage) {
 		}
 	}
 	if d.usage.InputTokens != nil && d.usage.OutputTokens != nil {
-		total := *d.usage.InputTokens + *d.usage.OutputTokens
+		total, ok := checkedTokenSum(*d.usage.InputTokens, *d.usage.OutputTokens)
+		if !ok {
+			*diagnostics = append(*diagnostics, makeDiagnostic(
+				canonical.SeverityError,
+				canonical.DiagnosticInvalidCacheUsage,
+				"input and output token counts overflow int64",
+				path,
+				nil,
+			))
+			return
+		}
 		d.usage.TotalTokens = &total
 	}
+}
+
+func cloneStreamUsage(usage canonical.Usage) canonical.Usage {
+	return canonical.Usage{
+		InputTokens:           cloneStreamTokenCount(usage.InputTokens),
+		OutputTokens:          cloneStreamTokenCount(usage.OutputTokens),
+		TotalTokens:           cloneStreamTokenCount(usage.TotalTokens),
+		CachedInputTokens:     cloneStreamTokenCount(usage.CachedInputTokens),
+		CacheWriteInputTokens: cloneStreamTokenCount(usage.CacheWriteInputTokens),
+		Extensions:            cloneObject(usage.Extensions),
+	}
+}
+
+func cloneStreamTokenCount(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func (d *StreamDecoder) setFinishExtension(name string, raw json.RawMessage) {

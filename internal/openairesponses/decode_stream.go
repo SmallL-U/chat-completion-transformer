@@ -9,6 +9,8 @@ import (
 
 	"chat-completion-transformer/internal/canonical"
 	"chat-completion-transformer/internal/sse"
+
+	"github.com/tidwall/gjson"
 )
 
 type streamPhase uint8
@@ -795,7 +797,9 @@ func (d *StreamDecoder) requireActive(eventType string, raw json.RawMessage) *ca
 func streamEventType(object canonical.Object, eventName string) (string, *canonical.Diagnostic) {
 	typeName := ""
 	if raw, exists := object["type"]; exists {
-		if err := json.Unmarshal(raw, &typeName); err != nil || typeName == "" {
+		var ok bool
+		typeName, ok = streamJSONString(raw)
+		if !ok || typeName == "" {
 			diagnostic := streamEventDiagnostic("stream event type must be a non-empty string", "type", raw)
 			return "", &diagnostic
 		}
@@ -819,8 +823,8 @@ func streamRequiredString(raw json.RawMessage, path string, diagnostics *[]canon
 		*diagnostics = append(*diagnostics, streamEventDiagnostic(path+" is required", path, raw))
 		return ""
 	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, ok := streamJSONString(raw)
+	if !ok {
 		*diagnostics = append(*diagnostics, streamEventDiagnostic(path+" must be a string", path, raw))
 		return ""
 	}
@@ -835,8 +839,8 @@ func streamRequiredStringValue(raw json.RawMessage, path string, diagnostics *[]
 		*diagnostics = append(*diagnostics, streamEventDiagnostic(path+" is required", path, raw))
 		return ""
 	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, ok := streamJSONString(raw)
+	if !ok {
 		*diagnostics = append(*diagnostics, streamEventDiagnostic(path+" must be a string", path, raw))
 	}
 	return value
@@ -846,11 +850,22 @@ func streamOptionalString(raw json.RawMessage, path string, diagnostics *[]canon
 	if !hasJSONValue(raw) {
 		return ""
 	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, ok := streamJSONString(raw)
+	if !ok {
 		*diagnostics = append(*diagnostics, streamEventDiagnostic(path+" must be a string", path, raw))
 	}
 	return value
+}
+
+func streamJSONString(raw json.RawMessage) (string, bool) {
+	// raw has already been validated as one canonical.Object value. Keeping
+	// object decoding ahead of this scalar fast path preserves its duplicate-key
+	// and unknown-field behavior.
+	result := gjson.ParseBytes(raw)
+	if result.Type != gjson.String {
+		return "", false
+	}
+	return result.String(), true
 }
 
 func streamRequiredInt(raw json.RawMessage, path string, diagnostics *[]canonical.Diagnostic) int {
@@ -906,9 +921,13 @@ func opaqueStreamEvent(raw json.RawMessage) canonical.Event {
 
 func asStreamDiagnostics(diagnostics []canonical.Diagnostic) []canonical.Diagnostic {
 	for index := range diagnostics {
-		if diagnostics[index].Severity == canonical.SeverityError {
-			diagnostics[index].Code = DiagnosticInvalidStreamEvent
+		if diagnostics[index].Severity != canonical.SeverityError {
+			continue
 		}
+		if diagnostics[index].Code == canonical.DiagnosticInvalidCacheUsage {
+			continue
+		}
+		diagnostics[index].Code = DiagnosticInvalidStreamEvent
 	}
 	return diagnostics
 }

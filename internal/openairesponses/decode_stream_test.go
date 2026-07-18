@@ -1,6 +1,7 @@
 package openairesponses
 
 import (
+	"encoding/json"
 	"math/rand"
 	"strings"
 	"testing"
@@ -57,6 +58,10 @@ func TestStreamDecoderDecodesTextRefusalToolsUsageAndUnknown(t *testing.T) {
 	}
 	if events[10].Type != canonical.EventUsage || events[10].Usage == nil || *events[10].Usage.TotalTokens != 14 {
 		t.Fatalf("usage event = %#v", events[10])
+	}
+	if events[10].Usage.CachedInputTokens == nil || *events[10].Usage.CachedInputTokens != 2 ||
+		events[10].Usage.CacheWriteInputTokens == nil || *events[10].Usage.CacheWriteInputTokens != 0 {
+		t.Fatalf("cache usage event = %#v", events[10].Usage)
 	}
 	if events[11].Type != canonical.EventFinish || events[11].Reason == nil || *events[11].Reason != canonical.FinishReasonToolCalls {
 		t.Fatalf("finish event = %#v", events[11])
@@ -177,6 +182,56 @@ func TestStreamDecoderMapsIncompleteUsageAndReason(t *testing.T) {
 	}
 }
 
+func TestStreamDecoderMapsStandalonePromptCacheUsage(t *testing.T) {
+	stream := sseFrame("response.created", `{"type":"response.created","response":{"id":"resp","output":[]}}`) +
+		sseFrame("response.usage", `{"type":"response.usage","usage":{"input_tokens":8,"output_tokens":1,"total_tokens":9,"input_tokens_details":{"cached_tokens":4,"cache_write_tokens":0,"future":true}}}`) +
+		sseFrame("response.completed", `{"type":"response.completed","response":{"id":"resp","status":"completed","output":[]}}`)
+	decoder := NewStreamDecoder(0)
+	result := decoder.Feed([]byte(stream))
+	if !result.OK || result.Value == nil {
+		t.Fatalf("Feed() = %#v", result)
+	}
+	events := *result.Value
+	if len(events) != 3 || events[1].Type != canonical.EventUsage || events[1].Usage == nil {
+		t.Fatalf("events = %#v", events)
+	}
+	usage := events[1].Usage
+	if usage.CachedInputTokens == nil || *usage.CachedInputTokens != 4 ||
+		usage.CacheWriteInputTokens == nil || *usage.CacheWriteInputTokens != 0 {
+		t.Fatalf("cache usage = %#v", usage)
+	}
+	details := usage.Extensions["input_tokens_details"]
+	if !strings.Contains(string(details), `"future":true`) || strings.Contains(string(details), "cached_tokens") {
+		t.Fatalf("residual details = %s", details)
+	}
+	if closeResult := decoder.Close(); !closeResult.OK {
+		t.Fatalf("Close() = %#v", closeResult)
+	}
+}
+
+func TestStreamDecoderRejectsInvalidPromptCacheUsage(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		details string
+	}{
+		{name: "details null", details: `null`},
+		{name: "cached null", details: `{"cached_tokens":null}`},
+		{name: "cached negative", details: `{"cached_tokens":-1}`},
+		{name: "write null", details: `{"cache_write_tokens":null}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stream := sseFrame("response.created", `{"type":"response.created","response":{"id":"resp","output":[]}}`) +
+				sseFrame("response.usage", `{"type":"response.usage","usage":{"input_tokens_details":`+test.details+`}}`)
+			decoder := NewStreamDecoder(0)
+			result := decoder.Feed([]byte(stream))
+			if result.OK || result.Value != nil {
+				t.Fatalf("invalid stream cache usage unexpectedly succeeded: %#v", result)
+			}
+			assertDiagnosticCode(t, result.Diagnostics, canonical.DiagnosticInvalidCacheUsage)
+		})
+	}
+}
+
 func TestStreamDecoderReconcilesTerminalOutputWhenDoneEventsAreMissing(t *testing.T) {
 	stream := sseFrame("response.created", `{"type":"response.created","response":{"id":"resp","output":[]}}`) +
 		sseFrame("response.output_text.delta", `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hel"}`) +
@@ -219,6 +274,41 @@ func TestStreamDecoderRejectsTerminalOutputThatConflictsWithDeltas(t *testing.T)
 	assertDiagnosticCode(t, result.Diagnostics, DiagnosticInvalidStreamState)
 }
 
+func TestStreamJSONStringPreservesStrictTypesAndEscapes(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		raw   json.RawMessage
+		want  string
+		valid bool
+	}{
+		{name: "escaped", raw: json.RawMessage(`"hello\u0020world\n\"quoted\""`), want: "hello world\n\"quoted\"", valid: true},
+		{name: "empty", raw: json.RawMessage(`""`), want: "", valid: true},
+		{name: "null", raw: json.RawMessage(`null`)},
+		{name: "number", raw: json.RawMessage(`1`)},
+		{name: "boolean", raw: json.RawMessage(`true`)},
+		{name: "object", raw: json.RawMessage(`{}`)},
+		{name: "array", raw: json.RawMessage(`[]`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, valid := streamJSONString(test.raw)
+			if valid != test.valid || got != test.want {
+				t.Fatalf("streamJSONString(%s) = %q, %t; want %q, %t", test.raw, got, valid, test.want, test.valid)
+			}
+		})
+	}
+}
+
+func TestStreamEventTypeRetainsCanonicalDuplicateKeyBehavior(t *testing.T) {
+	object, err := canonical.DecodeObject([]byte(`{"type":"first","type":"second"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	typeName, typeDiagnostic := streamEventType(object, "message")
+	if typeDiagnostic != nil || typeName != "second" {
+		t.Fatalf("streamEventType() = %q, %#v", typeName, typeDiagnostic)
+	}
+}
+
 func compactToolStream() string {
 	return sseFrame("response.created", `{"type":"response.created","response":{"id":"resp","created_at":1,"model":"gpt-test","status":"in_progress","output":[]}}`) +
 		sseFrame("response.output_item.added", `{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc","call_id":"call","name":"f","arguments":""}}`) +
@@ -229,7 +319,7 @@ func compactToolStream() string {
 }
 
 func completedEventJSON() string {
-	return `{"type":"response.completed","sequence_number":11,"response":{"id":"resp_1","created_at":123,"model":"gpt-test","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]},{"type":"refusal","refusal":"nope"}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"weather","arguments":"{\"city\":\"Beijing\"}"}],"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14,"input_tokens_details":{"cached_tokens":2}}}}`
+	return `{"type":"response.completed","sequence_number":11,"response":{"id":"resp_1","created_at":123,"model":"gpt-test","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]},{"type":"refusal","refusal":"nope"}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"weather","arguments":"{\"city\":\"Beijing\"}"}],"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":0}}}}`
 }
 
 func sseFrame(name string, data string) string {

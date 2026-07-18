@@ -77,6 +77,8 @@ transformer:
     - provider: openai
       endpoint: responses
       model: gpt-example
+      prompt_cache:
+        mode: openai_5_6
       temperature: true
       top_p: true
       structured_output: true
@@ -86,6 +88,8 @@ transformer:
     - provider: anthropic
       endpoint: messages
       model: claude-example
+      prompt_cache:
+        mode: anthropic
       temperature: true
       top_p: true
       top_k: true
@@ -111,6 +115,189 @@ Only direct OpenAI Responses and direct Anthropic Messages HTTP upstreams are
 supported by the gateway. Remote upstream URLs must use HTTPS. Loopback HTTP is
 allowed for local development. URLs containing user information, query strings,
 or fragments are rejected, and redirects are not followed.
+
+## Prompt cache control
+
+The gateway maps provider prompt-cache directives; it does not implement a
+local cache. It never stores prompts, cache keys, KV state, or provider cache
+entries, does not inject cache-write directives, and does not generate a
+`prompt_cache_key`. Provider-side automatic caching can still apply when it is
+the upstream default.
+
+### Capability profiles
+
+Prompt-cache behavior is selected explicitly on the exact model profile. An
+omitted `prompt_cache.mode` is normalized to `none`; model names are never used
+to infer an API generation.
+
+| `prompt_cache.mode` | Valid target | Accepted controls |
+| --- | --- | --- |
+| `none` | Any valid profile | No prompt-cache directive |
+| `anthropic` | Direct Anthropic Messages | Top-level and content/tool `cache_control` |
+| `openai_legacy` | OpenAI Responses | `prompt_cache_key` and enabled legacy retention values |
+| `openai_5_6` | OpenAI Responses | `prompt_cache_key`, `prompt_cache_options`, and input block breakpoints |
+
+Legacy retention values must also be enabled by the exact profile:
+
+```yaml
+prompt_cache:
+  mode: openai_legacy
+  in_memory_retention: true
+  extended_retention_24h: true
+```
+
+These booleans permit callers to send `prompt_cache_retention: "in_memory"`
+and `prompt_cache_retention: "24h"`, respectively; they do not choose or inject
+a retention value. `in-memory` and other spellings are not rewritten as
+aliases.
+
+Known cache directives are type-checked and gated by the selected profile.
+Malformed values and invalid placements are rejected. A valid directive that
+the target profile does not support fails in `strict` mode; in `compatible` and
+`emulate` modes it is dropped with a transformer warning. Arbitrary extension
+fields are never passed through.
+
+### Anthropic Messages
+
+Top-level `cache_control` enables Anthropic automatic prompt caching. Omitting
+`ttl` selects the provider's default 5-minute TTL; the explicit values supported
+by the gateway are `5m` and `1h`.
+
+```json
+{
+  "model": "anthropic-example",
+  "cache_control": {
+    "type": "ephemeral",
+    "ttl": "1h"
+  },
+  "messages": [
+    {"role": "user", "content": "Hello"}
+  ]
+}
+```
+
+Explicit breakpoints stay on their original Chat Completions content block or
+on the outer `tools[*]` wrapper:
+
+```json
+{
+  "model": "anthropic-example",
+  "messages": [
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "text",
+          "text": "Large stable instructions",
+          "cache_control": {"type": "ephemeral"}
+        }
+      ]
+    },
+    {"role": "user", "content": "Hello"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "cache_control": {"type": "ephemeral", "ttl": "1h"},
+      "function": {
+        "name": "lookup",
+        "description": "Look up a value",
+        "parameters": {"type": "object"}
+      }
+    }
+  ]
+}
+```
+
+`function.cache_control` is not accepted as an alias. Cache control on
+Anthropic `tool_use` or `tool_result` wrappers, and on content nested inside a
+tool result, is outside the current gateway scope.
+
+### OpenAI Responses
+
+Both OpenAI profile generations accept a caller-supplied, non-empty
+`prompt_cache_key`. Reuse a stable key for requests intended to share the same
+stable prefix; do not use a unique request ID.
+
+Legacy example:
+
+```json
+{
+  "model": "openai-legacy-example",
+  "prompt_cache_key": "tenant:acme:prompt-v1",
+  "prompt_cache_retention": "in_memory",
+  "messages": [
+    {"role": "user", "content": "Hello"}
+  ]
+}
+```
+
+GPT-5.6+ example with an explicit input breakpoint:
+
+```json
+{
+  "model": "openai-example",
+  "prompt_cache_key": "tenant:acme:prompt-v1",
+  "prompt_cache_options": {
+    "mode": "explicit",
+    "ttl": "30m"
+  },
+  "messages": [
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "text",
+          "text": "Large stable instructions",
+          "prompt_cache_breakpoint": {"mode": "explicit"}
+        }
+      ]
+    },
+    {"role": "user", "content": "Hello"}
+  ]
+}
+```
+
+GPT-5.6+ breakpoints are accepted only on input text, image, and file blocks.
+Legacy profiles reject `prompt_cache_options` and block breakpoints; GPT-5.6+
+profiles reject `prompt_cache_retention`.
+
+### Usage and operational notes
+
+When reported by the provider, buffered responses and the final SSE usage chunk
+include cache details in the Chat Completions usage object:
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 1200,
+    "completion_tokens": 80,
+    "total_tokens": 1280,
+    "prompt_tokens_details": {
+      "cached_tokens": 900,
+      "cache_write_tokens": 0
+    }
+  }
+}
+```
+
+`prompt_tokens_details` and each nested field are omitted when the provider does
+not report them; an explicitly reported zero remains zero. For Anthropic,
+`prompt_tokens` includes uncached input, cache-created input, and cache-read
+input, so cache use does not under-report the logical prompt size. For streams,
+set `stream_options.include_usage` to receive the final usage chunk.
+
+Provider cache writes and longer retention can have different prices from
+ordinary input or cache reads. Check current provider pricing before enabling
+them broadly. The gateway does not guarantee a cache hit: the provider decides
+whether an entry is written, retained, and reused, and usage details are the
+observable result.
+
+The following remain deliberately unsupported: cache warm-up through Anthropic
+`max_tokens: 0`, route-injected cache policies, automatic breakpoint selection,
+automatic key derivation or sharding, Bedrock/Vertex cache behavior, hit-rate or
+cost reporting, provider cache deletion/invalidation APIs, and treating
+`previous_response_id`, `conversation`, or `store` as prompt-cache controls.
 
 Run the checks and start the server:
 

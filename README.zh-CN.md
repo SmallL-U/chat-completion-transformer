@@ -73,6 +73,8 @@ transformer:
     - provider: openai
       endpoint: responses
       model: gpt-example
+      prompt_cache:
+        mode: openai_5_6
       temperature: true
       top_p: true
       structured_output: true
@@ -82,6 +84,8 @@ transformer:
     - provider: anthropic
       endpoint: messages
       model: claude-example
+      prompt_cache:
+        mode: anthropic
       temperature: true
       top_p: true
       top_k: true
@@ -106,6 +110,176 @@ transformer:
 网关只支持直连 OpenAI Responses 和 Anthropic Messages HTTP 端点。远程上游必须
 使用 HTTPS；本地开发可以使用回环地址 HTTP。上游 URL 不允许包含用户信息、查询
 参数或 fragment，网关也不会跟随重定向。
+
+## Prompt 缓存控制
+
+网关只负责映射供应商的 prompt cache 控制字段，不实现本地缓存。它不会保存 prompt、
+cache key、KV 状态或供应商 cache entry，不会主动注入 cache-write 控制字段，也不会生成
+`prompt_cache_key`；如果上游默认启用自动缓存，供应商侧仍可能自行写入缓存。
+
+### Capability profile
+
+Prompt cache 行为必须显式配置在精确的模型 profile 上。省略 `prompt_cache.mode` 时会
+归一化为 `none`；系统不会根据模型名推断 API 代际。
+
+| `prompt_cache.mode` | 有效目标 | 接受的控制字段 |
+| --- | --- | --- |
+| `none` | 任意有效 profile | 不接受 prompt cache directive |
+| `anthropic` | 直连 Anthropic Messages | 顶层以及 content/tool 上的 `cache_control` |
+| `openai_legacy` | OpenAI Responses | `prompt_cache_key` 和 profile 已启用的 legacy retention 值 |
+| `openai_5_6` | OpenAI Responses | `prompt_cache_key`、`prompt_cache_options` 和 input block 断点 |
+
+Legacy retention 值还需要在精确 profile 中分别启用：
+
+```yaml
+prompt_cache:
+  mode: openai_legacy
+  in_memory_retention: true
+  extended_retention_24h: true
+```
+
+这两个布尔值分别允许调用方发送 `prompt_cache_retention: "in_memory"` 和
+`prompt_cache_retention: "24h"`，不会替调用方选择或注入 retention 值。
+`in-memory` 等其他拼写不会被自动改写为别名。
+
+已知缓存字段会经过类型校验和 capability gate。字段结构或位置非法时，请求会被
+拒绝；合法字段但目标 profile 不支持时，`strict` 模式失败，`compatible` 和
+`emulate` 模式丢弃该字段并返回 Transformer warning。任意 extension 都不会因此获得
+通用透传能力。
+
+### Anthropic Messages
+
+顶层 `cache_control` 用于开启 Anthropic 自动 prompt caching。省略 `ttl` 时使用
+供应商默认的 5 分钟 TTL；网关接受的显式值为 `5m` 和 `1h`。
+
+```json
+{
+  "model": "anthropic-example",
+  "cache_control": {
+    "type": "ephemeral",
+    "ttl": "1h"
+  },
+  "messages": [
+    {"role": "user", "content": "你好"}
+  ]
+}
+```
+
+显式断点保留在原 Chat Completions content block，或放在 `tools[*]` 外层：
+
+```json
+{
+  "model": "anthropic-example",
+  "messages": [
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "text",
+          "text": "较长且稳定的系统指令",
+          "cache_control": {"type": "ephemeral"}
+        }
+      ]
+    },
+    {"role": "user", "content": "你好"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "cache_control": {"type": "ephemeral", "ttl": "1h"},
+      "function": {
+        "name": "lookup",
+        "description": "查询一个值",
+        "parameters": {"type": "object"}
+      }
+    }
+  ]
+}
+```
+
+`function.cache_control` 不作为别名接受。在 Anthropic `tool_use`、`tool_result`
+wrapper 或 tool result 内嵌 content 上放置 cache control 也不属于当前网关支持范围。
+
+### OpenAI Responses
+
+两种 OpenAI profile 代际都接受调用方提供的非空 `prompt_cache_key`。需要共享同一稳定
+前缀的请求应复用稳定 key，不要使用每次都不同的 request ID。
+
+Legacy 示例：
+
+```json
+{
+  "model": "openai-legacy-example",
+  "prompt_cache_key": "tenant:acme:prompt-v1",
+  "prompt_cache_retention": "in_memory",
+  "messages": [
+    {"role": "user", "content": "你好"}
+  ]
+}
+```
+
+GPT-5.6+ 显式 input 断点示例：
+
+```json
+{
+  "model": "openai-example",
+  "prompt_cache_key": "tenant:acme:prompt-v1",
+  "prompt_cache_options": {
+    "mode": "explicit",
+    "ttl": "30m"
+  },
+  "messages": [
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "text",
+          "text": "较长且稳定的系统指令",
+          "prompt_cache_breakpoint": {"mode": "explicit"}
+        }
+      ]
+    },
+    {"role": "user", "content": "你好"}
+  ]
+}
+```
+
+GPT-5.6+ 断点只允许出现在 input text、image 和 file block。Legacy profile 拒绝
+`prompt_cache_options` 和 block breakpoint；GPT-5.6+ profile 拒绝
+`prompt_cache_retention`。
+
+### Usage 与运行提示
+
+供应商实际报告缓存统计时，普通响应和 SSE 最后的 usage chunk 会使用 Chat
+Completions usage 结构返回明细：
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 1200,
+    "completion_tokens": 80,
+    "total_tokens": 1280,
+    "prompt_tokens_details": {
+      "cached_tokens": 900,
+      "cache_write_tokens": 0
+    }
+  }
+}
+```
+
+供应商未报告时，`prompt_tokens_details` 或其中单个字段会被省略；供应商明确报告的
+`0` 会保留为 `0`。对 Anthropic 而言，`prompt_tokens` 包含未缓存输入、cache-create
+输入和 cache-read 输入，因此启用缓存后不会低报完整逻辑 prompt 大小。流式请求需要
+设置 `stream_options.include_usage` 才会收到最后的 usage chunk。
+
+供应商可能对 cache write、较长 retention、普通输入和 cache read 使用不同价格。
+大范围开启前请核对供应商当前定价。网关不保证缓存命中：是否写入、保留和复用由
+供应商决定，usage 明细只是可观察结果。
+
+以下能力明确延期，当前不宣称支持：通过 Anthropic `max_tokens: 0` 预热缓存、由 route
+注入缓存策略、自动选择断点、自动派生或分片 key、Bedrock/Vertex 缓存行为、命中率或
+成本报表、供应商缓存删除/失效 API，以及把 `previous_response_id`、`conversation` 或
+`store` 当作 prompt cache 控制。
 
 运行检查并启动服务：
 

@@ -193,8 +193,53 @@ func decodeUsage(raw json.RawMessage, path string, diagnostics *[]canonical.Diag
 	usage.InputTokens = decodeOptionalInt64(object["input_tokens"], path+".input_tokens", diagnostics)
 	usage.OutputTokens = decodeOptionalInt64(object["output_tokens"], path+".output_tokens", diagnostics)
 	usage.TotalTokens = decodeOptionalInt64(object["total_tokens"], path+".total_tokens", diagnostics)
-	usage.Extensions = cloneObjectExcept(object, "input_tokens", "output_tokens", "total_tokens")
+	usage.Extensions = cloneObjectExcept(object, "input_tokens", "output_tokens", "total_tokens", "input_tokens_details")
+	decodeInputTokenDetails(object["input_tokens_details"], path+".input_tokens_details", usage, diagnostics)
 	return usage
+}
+
+func decodeInputTokenDetails(
+	raw json.RawMessage,
+	path string,
+	usage *canonical.Usage,
+	diagnostics *[]canonical.Diagnostic,
+) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return
+	}
+	details, err := canonical.DecodeObject(raw)
+	if err != nil {
+		*diagnostics = append(*diagnostics, diagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			"response usage input_tokens_details must be an object",
+			path,
+			raw,
+		))
+		return
+	}
+
+	usage.CachedInputTokens = decodeOptionalCacheTokenCount(details["cached_tokens"], path+".cached_tokens", diagnostics)
+	usage.CacheWriteInputTokens = decodeOptionalCacheTokenCount(details["cache_write_tokens"], path+".cache_write_tokens", diagnostics)
+	residual := cloneObjectExcept(details, "cached_tokens", "cache_write_tokens")
+	if len(residual) == 0 {
+		return
+	}
+	encoded, err := json.Marshal(residual)
+	if err != nil {
+		*diagnostics = append(*diagnostics, diagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			fmt.Sprintf("preserve response usage input token details: %v", err),
+			path,
+			raw,
+		))
+		return
+	}
+	if usage.Extensions == nil {
+		usage.Extensions = make(canonical.Object)
+	}
+	usage.Extensions["input_tokens_details"] = encoded
 }
 
 func responseFinishReason(
@@ -310,11 +355,40 @@ func decodeOptionalInt64(raw json.RawMessage, path string, diagnostics *[]canoni
 		return nil
 	}
 	var value int64
-	if err := json.Unmarshal(raw, &value); err != nil {
+	if err := json.Unmarshal(raw, &value); err != nil || value < 0 {
 		*diagnostics = append(*diagnostics, diagnostic(
 			canonical.SeverityError,
 			DiagnosticInvalidResponse,
-			fmt.Sprintf("%s must be an integer", path),
+			fmt.Sprintf("%s must be a non-negative integer", path),
+			path,
+			raw,
+		))
+		return nil
+	}
+	return &value
+}
+
+func decodeOptionalCacheTokenCount(raw json.RawMessage, path string, diagnostics *[]canonical.Diagnostic) *int64 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	var value int64
+	if bytes.Equal(trimmed, []byte("null")) {
+		*diagnostics = append(*diagnostics, diagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			fmt.Sprintf("%s must be a non-negative integer", path),
+			path,
+			raw,
+		))
+		return nil
+	}
+	if err := json.Unmarshal(raw, &value); err != nil || value < 0 {
+		*diagnostics = append(*diagnostics, diagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheUsage,
+			fmt.Sprintf("%s must be a non-negative integer", path),
 			path,
 			raw,
 		))

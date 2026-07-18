@@ -58,13 +58,14 @@ const (
 // Part is one unit of message or tool-result content.
 // Value retains the unmodified JSON for opaque provider content.
 type Part struct {
-	Kind     PartKind        `json:"kind"`
-	Text     string          `json:"text,omitempty"`
-	Source   *AssetSource    `json:"source,omitempty"`
-	Detail   *ImageDetail    `json:"detail,omitempty"`
-	Filename *string         `json:"filename,omitempty"`
-	Provider string          `json:"provider,omitempty"`
-	Value    json.RawMessage `json:"value,omitempty"`
+	Kind       PartKind        `json:"kind"`
+	Text       string          `json:"text,omitempty"`
+	Source     *AssetSource    `json:"source,omitempty"`
+	Detail     *ImageDetail    `json:"detail,omitempty"`
+	Filename   *string         `json:"filename,omitempty"`
+	Provider   string          `json:"provider,omitempty"`
+	Value      json.RawMessage `json:"value,omitempty"`
+	Extensions Object          `json:"extensions,omitempty"`
 }
 
 // ToolCall is a model-requested function invocation.
@@ -110,6 +111,7 @@ type ToolDefinition struct {
 	Description *string `json:"description,omitempty"`
 	InputSchema Object  `json:"input_schema"`
 	Strict      *bool   `json:"strict,omitempty"`
+	Extensions  Object  `json:"extensions,omitempty"`
 }
 
 // ToolChoiceMode controls whether and which tool may be selected.
@@ -165,14 +167,22 @@ type Request struct {
 	Extensions         Object            `json:"extensions,omitempty"`
 }
 
-// Usage contains provider-reported token counts. A nil field means the
+// Usage contains provider-reported token counts. InputTokens is the complete
+// logical input count, including cache reads and writes. CachedInputTokens and
+// CacheWriteInputTokens are subsets of InputTokens. A nil field means the
 // provider did not report that count.
 type Usage struct {
-	InputTokens  *int64 `json:"input_tokens,omitempty"`
-	OutputTokens *int64 `json:"output_tokens,omitempty"`
-	TotalTokens  *int64 `json:"total_tokens,omitempty"`
-	Extensions   Object `json:"extensions,omitempty"`
+	InputTokens           *int64 `json:"input_tokens,omitempty"`
+	OutputTokens          *int64 `json:"output_tokens,omitempty"`
+	TotalTokens           *int64 `json:"total_tokens,omitempty"`
+	CachedInputTokens     *int64 `json:"cached_input_tokens,omitempty"`
+	CacheWriteInputTokens *int64 `json:"cache_write_input_tokens,omitempty"`
+	Extensions            Object `json:"extensions,omitempty"`
 }
+
+// UsageExtensionAnthropicCacheCreation stores Anthropic's per-TTL cache-write
+// breakdown. CacheWriteInputTokens remains the canonical aggregate.
+const UsageExtensionAnthropicCacheCreation = "anthropic.cache_creation"
 
 // FinishReason is a normalized model stop reason.
 type FinishReason string
