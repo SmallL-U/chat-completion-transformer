@@ -102,6 +102,58 @@ func TestLoadYAML(t *testing.T) {
 	}
 }
 
+func TestLoadPreservesDottedRouteAlias(t *testing.T) {
+	clearConfigEnvironment(t)
+
+	const (
+		alias        = "gpt-5.6-luna"
+		upstreamName = "openmodel.ai"
+	)
+	configYAML := strings.ReplaceAll(validYAML, "general", alias)
+	configYAML = strings.ReplaceAll(configYAML, "gpt-test", alias)
+	configYAML = strings.ReplaceAll(configYAML, "openai-main", upstreamName)
+
+	config, err := Load(writeConfig(t, configYAML))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.Gateway.Routes[alias] != upstreamName {
+		t.Fatalf("Gateway routes = %+v, want exact alias %q", config.Gateway.Routes, alias)
+	}
+	if _, exists := config.Gateway.Upstreams[upstreamName]; !exists {
+		t.Fatalf("Gateway upstreams = %+v, want exact name %q", config.Gateway.Upstreams, upstreamName)
+	}
+	if len(config.Transformer.Routes) != 1 || config.Transformer.Routes[0].Alias != alias {
+		t.Fatalf("Transformer routes = %+v, want exact alias %q", config.Transformer.Routes, alias)
+	}
+}
+
+func TestLoadPreservesDottedRouteAliasFromEnvironment(t *testing.T) {
+	clearConfigEnvironment(t)
+
+	const (
+		alias        = "gpt-5.6-luna"
+		upstreamName = "openmodel.ai"
+	)
+	t.Setenv("CCT_GATEWAY_UPSTREAMS", `{"openmodel.ai":{"endpoint":"responses","url":"https://api.openmodel.ai/v1/responses"}}`)
+	t.Setenv("CCT_GATEWAY_ROUTES", `{"gpt-5.6-luna":"openmodel.ai"}`)
+	t.Setenv("CCT_TRANSFORMER_ROUTES", `[{"alias":"gpt-5.6-luna","targets":{"responses":"gpt-test"}}]`)
+
+	config, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.Gateway.Routes[alias] != upstreamName {
+		t.Fatalf("Gateway routes = %+v, want exact alias %q", config.Gateway.Routes, alias)
+	}
+	if _, exists := config.Gateway.Upstreams[upstreamName]; !exists {
+		t.Fatalf("Gateway upstreams = %+v, want exact name %q", config.Gateway.Upstreams, upstreamName)
+	}
+	if len(config.Transformer.Routes) != 1 || config.Transformer.Routes[0].Alias != alias {
+		t.Fatalf("Transformer routes = %+v, want exact alias %q", config.Transformer.Routes, alias)
+	}
+}
+
 func TestLoadPromptCacheYAML(t *testing.T) {
 	clearConfigEnvironment(t)
 	configYAML := strings.Replace(

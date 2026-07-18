@@ -49,6 +49,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 每个公开模型别名必须同时出现在 `gateway.routes` 和 `transformer.routes` 中：
 
+别名和上游名称可以包含点号；例如 `gpt-5.6-luna` 会作为完整 key 原样保留。
+
 ```yaml
 gateway:
   response_header_timeout: 5m

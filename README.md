@@ -53,6 +53,9 @@ need configured upstream and transformer routes.
 Each public model alias must appear in both `gateway.routes` and
 `transformer.routes`:
 
+Aliases and upstream names may contain periods; keys such as `gpt-5.6-luna`
+are preserved literally.
+
 ```yaml
 gateway:
   response_header_timeout: 5m

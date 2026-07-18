@@ -18,21 +18,25 @@ import (
 	"github.com/spf13/viper"
 )
 
-const defaultPath = "config.yml"
+const (
+	defaultPath        = "config.yml"
+	// Keep periods literal in model aliases and upstream map keys.
+	configKeyDelimiter = "::"
+)
 
 var scalarKeys = []string{
-	"server.address",
-	"server.gin_mode",
-	"server.read_header_timeout",
-	"server.idle_timeout",
-	"server.shutdown_timeout",
-	"server.max_body_bytes",
-	"server.max_stream_bytes",
-	"server.max_sse_event_bytes",
-	"gateway.response_header_timeout",
-	"transformer.mode",
-	"transformer.instruction_policy",
-	"transformer.anthropic_endpoint",
+	"server::address",
+	"server::gin_mode",
+	"server::read_header_timeout",
+	"server::idle_timeout",
+	"server::shutdown_timeout",
+	"server::max_body_bytes",
+	"server::max_stream_bytes",
+	"server::max_sse_event_bytes",
+	"gateway::response_header_timeout",
+	"transformer::mode",
+	"transformer::instruction_policy",
+	"transformer::anthropic_endpoint",
 }
 
 const defaultMaxOutputTokensEnvironment = "CCT_TRANSFORMER_DEFAULT_MAX_OUTPUT_TOKENS"
@@ -70,10 +74,10 @@ func Load(path string) (Config, error) {
 		path = defaultPath
 	}
 
-	v := viper.New()
+	v := viper.NewWithOptions(viper.KeyDelimiter(configKeyDelimiter))
 	v.SetConfigFile(path)
 	v.SetEnvPrefix("CCT")
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.SetEnvKeyReplacer(strings.NewReplacer(configKeyDelimiter, "_"))
 	v.AllowEmptyEnv(true)
 
 	if err := bindScalarEnvironment(v); err != nil {
@@ -136,16 +140,16 @@ func bindScalarEnvironment(v *viper.Viper) error {
 }
 
 func applyJSONEnvironment(v *viper.Viper) error {
-	if err := applyJSONOverride(v, "gateway.upstreams", "CCT_GATEWAY_UPSTREAMS", map[string]upstream.Config{}); err != nil {
+	if err := applyJSONOverride(v, "gateway::upstreams", "CCT_GATEWAY_UPSTREAMS", map[string]upstream.Config{}); err != nil {
 		return err
 	}
-	if err := applyJSONOverride(v, "gateway.routes", "CCT_GATEWAY_ROUTES", map[string]string{}); err != nil {
+	if err := applyJSONOverride(v, "gateway::routes", "CCT_GATEWAY_ROUTES", map[string]string{}); err != nil {
 		return err
 	}
-	if err := applyJSONOverride(v, "transformer.profiles", "CCT_TRANSFORMER_PROFILES", []capabilities.Profile{}); err != nil {
+	if err := applyJSONOverride(v, "transformer::profiles", "CCT_TRANSFORMER_PROFILES", []capabilities.Profile{}); err != nil {
 		return err
 	}
-	if err := applyJSONOverride(v, "transformer.routes", "CCT_TRANSFORMER_ROUTES", []capabilities.ModelRoute{}); err != nil {
+	if err := applyJSONOverride(v, "transformer::routes", "CCT_TRANSFORMER_ROUTES", []capabilities.ModelRoute{}); err != nil {
 		return err
 	}
 
