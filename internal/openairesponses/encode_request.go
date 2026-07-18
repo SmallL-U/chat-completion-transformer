@@ -513,8 +513,10 @@ func diagnoseOmittedTurnCacheExtensions(
 		if breakpoint == nil {
 			continue
 		}
-		diagnostics = append(diagnostics, invalidCacheBreakpointDiagnostic(
-			"prompt cache breakpoint cannot be attached to an omitted Responses message",
+		diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+			mode,
+			canonical.DiagnosticCacheBreakpointUnsupported,
+			"the Chat Completions prompt cache breakpoint cannot be represented because the Responses message is omitted",
 			path+".extensions.prompt_cache_breakpoint",
 			part.Extensions["prompt_cache_breakpoint"],
 		))
@@ -532,8 +534,8 @@ func diagnoseOmittedToolResultCacheExtensions(
 	for resultIndex, result := range results {
 		diagnostics = append(diagnostics, diagnoseOmittedTurnCacheExtensions(
 			result.Content,
-			canonical.Role(""),
-			false,
+			canonical.Role("tool_result"),
+			true,
 			profile,
 			mode,
 			fmt.Sprintf("turns.%d.results.%d.content", turnIndex, resultIndex),
@@ -618,7 +620,7 @@ func encodeContentPart(
 		profile,
 		mode,
 		path,
-		allowPromptCacheBreakpoint && role != canonical.RoleAssistant,
+		allowPromptCacheBreakpoint,
 	)
 	item, ok, partDiagnostics := encodeContentPartValue(ctx, role, part, profile, resolver, mode, path)
 	diagnostics := append(extensionDiagnostics, partDiagnostics...)
@@ -626,8 +628,10 @@ func encodeContentPart(
 		return item, ok, diagnostics
 	}
 	if !ok {
-		diagnostics = append(diagnostics, invalidCacheBreakpointDiagnostic(
-			"prompt cache breakpoint cannot be attached to an omitted Responses content block",
+		diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+			mode,
+			canonical.DiagnosticCacheBreakpointUnsupported,
+			"the Chat Completions prompt cache breakpoint cannot be represented because the Responses content block is omitted",
 			path+".extensions.prompt_cache_breakpoint",
 			part.Extensions["prompt_cache_breakpoint"],
 		))
@@ -635,8 +639,10 @@ func encodeContentPart(
 	}
 	encoded, mapOK := item.(map[string]any)
 	if !mapOK {
-		diagnostics = append(diagnostics, invalidCacheBreakpointDiagnostic(
-			"prompt cache breakpoint requires an object content block",
+		diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+			mode,
+			canonical.DiagnosticCacheBreakpointUnsupported,
+			"the Chat Completions prompt cache breakpoint cannot be represented on this Responses content block",
 			path+".extensions.prompt_cache_breakpoint",
 			part.Extensions["prompt_cache_breakpoint"],
 		))
@@ -660,12 +666,7 @@ func encodeContentPartValue(
 		if !profile.Content.Text {
 			return nil, false, []canonical.Diagnostic{unsupportedPartDiagnostic(mode, "text", path, part)}
 		}
-		typeName := "input_text"
-		if role == canonical.RoleAssistant {
-			typeName = "output_text"
-			return map[string]any{"type": typeName, "text": part.Text, "annotations": []any{}}, true, nil
-		}
-		return map[string]any{"type": typeName, "text": part.Text}, true, nil
+		return map[string]any{"type": "input_text", "text": part.Text}, true, nil
 	case canonical.PartRefusal:
 		if role != canonical.RoleAssistant {
 			return nil, false, []canonical.Diagnostic{unsupportedPartDiagnostic(mode, "refusal on a non-assistant message", path, part)}
@@ -844,7 +845,7 @@ func encodeToolOutput(
 	diagnostics := make([]canonical.Diagnostic, 0)
 	for index, part := range parts {
 		partPath := fmt.Sprintf("%s.%d", path, index)
-		item, ok, itemDiagnostics := encodeContentPart(ctx, canonical.Role("tool_result"), part, profile, resolver, mode, partPath, false)
+		item, ok, itemDiagnostics := encodeContentPart(ctx, canonical.Role("tool_result"), part, profile, resolver, mode, partPath, true)
 		diagnostics = append(diagnostics, itemDiagnostics...)
 		if ok {
 			content = append(content, item)
@@ -954,12 +955,8 @@ func encodePromptCacheExtensions(
 		switch name {
 		case "prompt_cache_key":
 			key, err := decodeCacheString(raw, name)
-			if err != nil || strings.TrimSpace(key) == "" {
-				message := "prompt_cache_key must be a non-empty string"
-				if err != nil {
-					message = err.Error()
-				}
-				diagnostics = append(diagnostics, invalidCacheControlDiagnostic(message, path, raw))
+			if err != nil {
+				diagnostics = append(diagnostics, invalidCacheControlDiagnostic(err.Error(), path, raw))
 				continue
 			}
 			if cacheMode != capabilities.PromptCacheOpenAILegacy && cacheMode != capabilities.PromptCacheOpenAI56 {
@@ -979,11 +976,11 @@ func encodePromptCacheExtensions(
 				diagnostics = append(diagnostics, invalidCacheControlDiagnostic(err.Error(), path, raw))
 				continue
 			}
-			if cacheMode != capabilities.PromptCacheOpenAILegacy {
+			if cacheMode != capabilities.PromptCacheOpenAILegacy && cacheMode != capabilities.PromptCacheOpenAI56 {
 				diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
 					mode,
 					canonical.DiagnosticCacheControlUnsupported,
-					"prompt_cache_retention is only supported by legacy Responses cache profiles",
+					"prompt_cache_retention is not supported by the selected Responses cache profile",
 					path,
 					raw,
 				))
@@ -1078,9 +1075,19 @@ func encodeContentPartExtensions(
 				diagnostics = append(diagnostics, invalidCacheControlDiagnostic(err.Error(), extensionPath, raw))
 				continue
 			}
-			if !allowPromptCacheBreakpoint || (part.Kind != canonical.PartText && part.Kind != canonical.PartImage && part.Kind != canonical.PartFile) {
+			if !validChatPromptCacheBreakpointPosition(part, role) {
 				diagnostics = append(diagnostics, invalidCacheBreakpointDiagnostic(
-					"Responses prompt cache breakpoints are only valid on input_text, input_image, and input_file blocks",
+					"prompt_cache_breakpoint is not valid at this Chat Completions content position",
+					extensionPath,
+					raw,
+				))
+				continue
+			}
+			if !allowPromptCacheBreakpoint || !responsesPromptCacheBreakpointPosition(part) {
+				diagnostics = append(diagnostics, unsupportedCacheControlDiagnostic(
+					mode,
+					canonical.DiagnosticCacheBreakpointUnsupported,
+					"the Chat Completions prompt cache breakpoint cannot be represented on the corresponding Responses content block",
 					extensionPath,
 					raw,
 				))
@@ -1134,6 +1141,23 @@ func encodeContentPartExtensions(
 		}
 	}
 	return breakpoint, diagnostics
+}
+
+func validChatPromptCacheBreakpointPosition(part canonical.Part, role canonical.Role) bool {
+	switch role {
+	case canonical.RoleSystem, canonical.RoleDeveloper:
+		return part.Kind == canonical.PartText
+	case canonical.RoleUser:
+		return part.Kind == canonical.PartText || part.Kind == canonical.PartImage || part.Kind == canonical.PartAudio || part.Kind == canonical.PartFile
+	case canonical.RoleAssistant, canonical.Role("tool_result"):
+		return part.Kind == canonical.PartText
+	default:
+		return false
+	}
+}
+
+func responsesPromptCacheBreakpointPosition(part canonical.Part) bool {
+	return part.Kind == canonical.PartText || part.Kind == canonical.PartImage || part.Kind == canonical.PartFile
 }
 
 func encodeToolExtensions(extensions canonical.Object, mode canonical.Mode, path string) []canonical.Diagnostic {

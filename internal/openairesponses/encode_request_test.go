@@ -3,6 +3,8 @@ package openairesponses
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 
 	"chat-completion-transformer/internal/canonical"
@@ -361,32 +363,65 @@ func TestEncodeRequestRejectsEmptyCanonicalMessages(t *testing.T) {
 	}
 }
 
-func TestEncodeRequestMapsLegacyPromptCacheFields(t *testing.T) {
-	for _, retention := range []string{"in_memory", "24h"} {
-		t.Run(retention, func(t *testing.T) {
+func TestEncodeRequestMapsPromptCacheRetentionByCapability(t *testing.T) {
+	for _, cacheMode := range []capabilities.PromptCacheMode{
+		capabilities.PromptCacheOpenAILegacy,
+		capabilities.PromptCacheOpenAI56,
+	} {
+		for _, retention := range []string{"in_memory", "24h"} {
+			t.Run(string(cacheMode)+"/"+retention, func(t *testing.T) {
+				request := canonical.Request{
+					Turns: []canonical.Turn{{
+						Kind:    canonical.TurnMessage,
+						Role:    canonical.RoleUser,
+						Content: []canonical.Part{{Kind: canonical.PartText, Text: "hello"}},
+					}},
+					Extensions: canonical.Object{
+						"prompt_cache_key":       json.RawMessage(`"tenant:demo"`),
+						"prompt_cache_retention": json.RawMessage(`"` + retention + `"`),
+					},
+				}
+				profile := testResponsesProfile()
+				profile.PromptCache = capabilities.PromptCacheCapabilities{
+					Mode:                 cacheMode,
+					InMemoryRetention:    true,
+					ExtendedRetention24h: true,
+				}
+				result := EncodeRequest(context.Background(), request, EncodeOptions{TargetModel: "gpt-test", Profile: profile})
+				if !result.OK || result.Value == nil || len(result.Diagnostics) != 0 {
+					t.Fatalf("EncodeRequest() = %#v", result)
+				}
+				if (*result.Value)["prompt_cache_key"] != "tenant:demo" || (*result.Value)["prompt_cache_retention"] != retention {
+					t.Fatalf("cache fields = %#v", *result.Value)
+				}
+			})
+		}
+	}
+}
+
+func TestEncodeRequestPreservesPromptCacheKeyStrings(t *testing.T) {
+	for _, key := range []string{"", " ", "tenant:demo"} {
+		t.Run(fmt.Sprintf("%q", key), func(t *testing.T) {
+			encodedKey, err := json.Marshal(key)
+			if err != nil {
+				t.Fatal(err)
+			}
 			request := canonical.Request{
 				Turns: []canonical.Turn{{
 					Kind:    canonical.TurnMessage,
 					Role:    canonical.RoleUser,
 					Content: []canonical.Part{{Kind: canonical.PartText, Text: "hello"}},
 				}},
-				Extensions: canonical.Object{
-					"prompt_cache_key":       json.RawMessage(`"tenant:demo"`),
-					"prompt_cache_retention": json.RawMessage(`"` + retention + `"`),
-				},
+				Extensions: canonical.Object{"prompt_cache_key": encodedKey},
 			}
 			profile := testResponsesProfile()
-			profile.PromptCache = capabilities.PromptCacheCapabilities{
-				Mode:                 capabilities.PromptCacheOpenAILegacy,
-				InMemoryRetention:    true,
-				ExtendedRetention24h: true,
-			}
+			profile.PromptCache.Mode = capabilities.PromptCacheOpenAI56
 			result := EncodeRequest(context.Background(), request, EncodeOptions{TargetModel: "gpt-test", Profile: profile})
 			if !result.OK || result.Value == nil || len(result.Diagnostics) != 0 {
 				t.Fatalf("EncodeRequest() = %#v", result)
 			}
-			if (*result.Value)["prompt_cache_key"] != "tenant:demo" || (*result.Value)["prompt_cache_retention"] != retention {
-				t.Fatalf("cache fields = %#v", *result.Value)
+			if (*result.Value)["prompt_cache_key"] != key {
+				t.Fatalf("prompt_cache_key = %#v, want %q", (*result.Value)["prompt_cache_key"], key)
 			}
 		})
 	}
@@ -483,9 +518,14 @@ func TestEncodeRequestRejectsMalformedPromptCacheDirectives(t *testing.T) {
 		part       canonical.Part
 	}{
 		{
-			name:       "empty key",
+			name:       "key null",
 			cacheMode:  capabilities.PromptCacheOpenAILegacy,
-			extensions: canonical.Object{"prompt_cache_key": json.RawMessage(`""`)},
+			extensions: canonical.Object{"prompt_cache_key": json.RawMessage(`null`)},
+		},
+		{
+			name:       "key type",
+			cacheMode:  capabilities.PromptCacheOpenAILegacy,
+			extensions: canonical.Object{"prompt_cache_key": json.RawMessage(`42`)},
 		},
 		{
 			name:       "legacy spelling",
@@ -552,6 +592,8 @@ func TestEncodeRequestGatesCacheFieldsByProfileAndMode(t *testing.T) {
 		name      string
 		mode      canonical.Mode
 		cacheMode capabilities.PromptCacheMode
+		inMemory  bool
+		extended  bool
 		field     string
 		raw       json.RawMessage
 		wantOK    bool
@@ -559,8 +601,8 @@ func TestEncodeRequestGatesCacheFieldsByProfileAndMode(t *testing.T) {
 	}{
 		{name: "legacy rejects options compatibly", mode: canonical.ModeCompatible, cacheMode: capabilities.PromptCacheOpenAILegacy, field: "prompt_cache_options", raw: json.RawMessage(`{"mode":"implicit"}`), wantOK: true, wantCode: canonical.DiagnosticCacheControlUnsupported},
 		{name: "legacy rejects options strictly", mode: canonical.ModeStrict, cacheMode: capabilities.PromptCacheOpenAILegacy, field: "prompt_cache_options", raw: json.RawMessage(`{"mode":"implicit"}`), wantOK: false, wantCode: canonical.DiagnosticCacheControlUnsupported},
-		{name: "legacy profile gates in-memory retention", mode: canonical.ModeCompatible, cacheMode: capabilities.PromptCacheOpenAILegacy, field: "prompt_cache_retention", raw: json.RawMessage(`"in_memory"`), wantOK: true, wantCode: canonical.DiagnosticCacheControlUnsupported},
-		{name: "5.6 rejects retention compatibly", mode: canonical.ModeCompatible, cacheMode: capabilities.PromptCacheOpenAI56, field: "prompt_cache_retention", raw: json.RawMessage(`"24h"`), wantOK: true, wantCode: canonical.DiagnosticCacheControlUnsupported},
+		{name: "legacy profile gates in-memory retention", mode: canonical.ModeCompatible, cacheMode: capabilities.PromptCacheOpenAILegacy, extended: true, field: "prompt_cache_retention", raw: json.RawMessage(`"in_memory"`), wantOK: true, wantCode: canonical.DiagnosticCacheControlUnsupported},
+		{name: "5.6 profile gates 24h retention", mode: canonical.ModeCompatible, cacheMode: capabilities.PromptCacheOpenAI56, inMemory: true, field: "prompt_cache_retention", raw: json.RawMessage(`"24h"`), wantOK: true, wantCode: canonical.DiagnosticCacheControlUnsupported},
 		{name: "none rejects key compatibly", mode: canonical.ModeCompatible, cacheMode: capabilities.PromptCacheNone, field: "prompt_cache_key", raw: json.RawMessage(`"tenant"`), wantOK: true, wantCode: canonical.DiagnosticCacheControlUnsupported},
 		{name: "wrong provider cache control", mode: canonical.ModeCompatible, cacheMode: capabilities.PromptCacheOpenAI56, field: "cache_control", raw: json.RawMessage(`{"type":"ephemeral"}`), wantOK: true, wantCode: canonical.DiagnosticCacheControlProviderMismatch},
 		{name: "wrong provider cache control strictly", mode: canonical.ModeStrict, cacheMode: capabilities.PromptCacheOpenAI56, field: "cache_control", raw: json.RawMessage(`{"type":"ephemeral"}`), wantOK: false, wantCode: canonical.DiagnosticCacheControlProviderMismatch},
@@ -572,7 +614,11 @@ func TestEncodeRequestGatesCacheFieldsByProfileAndMode(t *testing.T) {
 				Extensions: canonical.Object{test.field: test.raw},
 			}
 			profile := testResponsesProfile()
-			profile.PromptCache.Mode = test.cacheMode
+			profile.PromptCache = capabilities.PromptCacheCapabilities{
+				Mode:                 test.cacheMode,
+				InMemoryRetention:    test.inMemory,
+				ExtendedRetention24h: test.extended,
+			}
 			result := EncodeRequest(context.Background(), request, EncodeOptions{TargetModel: "gpt-test", Mode: test.mode, Profile: profile})
 			if result.OK != test.wantOK {
 				t.Fatalf("OK = %v, want %v: %#v", result.OK, test.wantOK, result)
@@ -664,49 +710,115 @@ func TestEncodeRequestRejectsMalformedCrossProviderCacheControl(t *testing.T) {
 	}
 }
 
-func TestEncodeRequestRejectsPromptCacheBreakpointInInvalidPositions(t *testing.T) {
+func TestEncodeRequestMapsAssistantTextPromptCacheBreakpoint(t *testing.T) {
 	breakpoint := canonical.Object{"prompt_cache_breakpoint": json.RawMessage(`{"mode":"explicit"}`)}
-	tests := []struct {
-		name  string
-		turns []canonical.Turn
-	}{
+	request := canonical.Request{Turns: []canonical.Turn{
+		{Kind: canonical.TurnMessage, Role: canonical.RoleUser, Content: []canonical.Part{{Kind: canonical.PartText, Text: "hello"}}},
+		{Kind: canonical.TurnMessage, Role: canonical.RoleAssistant, Content: []canonical.Part{
+			{Kind: canonical.PartText, Text: "stable answer"},
+			{Kind: canonical.PartText, Text: "cache here", Extensions: breakpoint},
+		}},
+	}}
+	profile := testResponsesProfile()
+	profile.PromptCache.Mode = capabilities.PromptCacheOpenAI56
+	result := EncodeRequest(context.Background(), request, EncodeOptions{TargetModel: "gpt-test", Profile: profile})
+	if !result.OK || result.Value == nil || len(result.Diagnostics) != 0 {
+		t.Fatalf("EncodeRequest() = %#v", result)
+	}
+
+	input := (*result.Value)["input"].([]any)
+	message := input[1].(map[string]any)
+	content := message["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("assistant content = %#v", content)
+	}
+	for index, part := range content {
+		if part.(map[string]any)["type"] != "input_text" {
+			t.Fatalf("assistant content[%d] = %#v", index, part)
+		}
+	}
+	assertExplicitBreakpoint(t, content[1].(map[string]any))
+}
+
+func TestEncodeRequestDiagnosesAudioBreakpointUnsupportedByResponses(t *testing.T) {
+	breakpoint := canonical.Object{"prompt_cache_breakpoint": json.RawMessage(`{"mode":"explicit"}`)}
+	request := canonical.Request{Turns: []canonical.Turn{{
+		Kind: canonical.TurnMessage,
+		Role: canonical.RoleUser,
+		Content: []canonical.Part{
+			{Kind: canonical.PartText, Text: "hello"},
+			{Kind: canonical.PartAudio, Extensions: breakpoint},
+		},
+	}}}
+	for _, mode := range []canonical.Mode{canonical.ModeStrict, canonical.ModeCompatible, canonical.ModeEmulate} {
+		t.Run(string(mode), func(t *testing.T) {
+			profile := testResponsesProfile()
+			profile.PromptCache.Mode = capabilities.PromptCacheOpenAI56
+			result := EncodeRequest(context.Background(), request, EncodeOptions{TargetModel: "gpt-test", Mode: mode, Profile: profile})
+			if result.OK != (mode != canonical.ModeStrict) {
+				t.Fatalf("EncodeRequest() = %#v", result)
+			}
+			assertDiagnosticCode(t, result.Diagnostics, canonical.DiagnosticCacheBreakpointUnsupported)
+			if result.Value == nil {
+				return
+			}
+			encoded, err := json.Marshal(result.Value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), "prompt_cache_breakpoint") {
+				t.Fatalf("unsupported breakpoint was forwarded: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestEncodeRequestMapsToolResultPromptCacheBreakpoint(t *testing.T) {
+	breakpoint := canonical.Object{"prompt_cache_breakpoint": json.RawMessage(`{"mode":"explicit"}`)}
+	request := canonical.Request{Turns: []canonical.Turn{
+		{Kind: canonical.TurnMessage, Role: canonical.RoleUser, Content: []canonical.Part{{Kind: canonical.PartText, Text: "hello"}}},
 		{
-			name: "assistant output text",
-			turns: []canonical.Turn{{
-				Kind:    canonical.TurnMessage,
-				Role:    canonical.RoleAssistant,
-				Content: []canonical.Part{{Kind: canonical.PartText, Text: "hello", Extensions: breakpoint}},
+			Kind: canonical.TurnMessage,
+			Role: canonical.RoleAssistant,
+			ToolCalls: []canonical.ToolCall{{
+				ID:           "call_1",
+				Name:         "lookup",
+				ArgumentsRaw: `{}`,
 			}},
 		},
 		{
-			name: "function call output",
-			turns: []canonical.Turn{
-				{
-					Kind: canonical.TurnMessage,
-					Role: canonical.RoleAssistant,
-					ToolCalls: []canonical.ToolCall{{
-						ID:           "call_1",
-						Name:         "lookup",
-						ArgumentsRaw: `{}`,
-					}},
-				},
-				{
-					Kind: canonical.TurnToolResults,
-					Results: []canonical.ToolResult{{
-						CallID:  "call_1",
-						Content: []canonical.Part{{Kind: canonical.PartText, Text: "result", Extensions: breakpoint}},
-					}},
-				},
-			},
+			Kind: canonical.TurnToolResults,
+			Results: []canonical.ToolResult{{
+				CallID:  "call_1",
+				Content: []canonical.Part{{Kind: canonical.PartText, Text: "result", Extensions: breakpoint}},
+			}},
 		},
+	}}
+	profile := testResponsesProfile()
+	profile.PromptCache.Mode = capabilities.PromptCacheOpenAI56
+	result := EncodeRequest(context.Background(), request, EncodeOptions{TargetModel: "gpt-test", Profile: profile})
+	if !result.OK || result.Value == nil || len(result.Diagnostics) != 0 {
+		t.Fatalf("EncodeRequest() = %#v", result)
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
+
+	input := (*result.Value)["input"].([]any)
+	output := input[len(input)-1].(map[string]any)["output"].([]any)
+	assertExplicitBreakpoint(t, output[0].(map[string]any))
+}
+
+func TestEncodeRequestRejectsBreakpointOutsideChatSchema(t *testing.T) {
+	breakpoint := canonical.Object{"prompt_cache_breakpoint": json.RawMessage(`{"mode":"explicit"}`)}
+	request := canonical.Request{Turns: []canonical.Turn{
+		{Kind: canonical.TurnMessage, Role: canonical.RoleUser, Content: []canonical.Part{{Kind: canonical.PartText, Text: "hello"}}},
+		{Kind: canonical.TurnMessage, Role: canonical.RoleAssistant, Content: []canonical.Part{{Kind: canonical.PartRefusal, Text: "no", Extensions: breakpoint}}},
+	}}
+	for _, mode := range []canonical.Mode{canonical.ModeStrict, canonical.ModeCompatible, canonical.ModeEmulate} {
+		t.Run(string(mode), func(t *testing.T) {
 			profile := testResponsesProfile()
 			profile.PromptCache.Mode = capabilities.PromptCacheOpenAI56
-			result := EncodeRequest(context.Background(), canonical.Request{Turns: test.turns}, EncodeOptions{TargetModel: "gpt-test", Profile: profile})
+			result := EncodeRequest(context.Background(), request, EncodeOptions{TargetModel: "gpt-test", Mode: mode, Profile: profile})
 			if result.OK || result.Value != nil {
-				t.Fatalf("invalid breakpoint position unexpectedly succeeded: %#v", result)
+				t.Fatalf("invalid Chat breakpoint position unexpectedly succeeded: %#v", result)
 			}
 			assertDiagnosticCode(t, result.Diagnostics, canonical.DiagnosticCacheBreakpointUnsupported)
 		})
@@ -724,11 +836,12 @@ func TestEncodeRequestRejectsCanonicalCacheDirectivePositionLoss(t *testing.T) {
 		}}}
 	}
 	tests := []struct {
-		name    string
-		request func() canonical.Request
-		profile func() capabilities.Profile
-		code    canonical.DiagnosticCode
-		path    string
+		name      string
+		request   func() canonical.Request
+		profile   func() capabilities.Profile
+		code      canonical.DiagnosticCode
+		path      string
+		modeAware bool
 	}{
 		{
 			name: "breakpoint on omitted content",
@@ -743,8 +856,9 @@ func TestEncodeRequestRejectsCanonicalCacheDirectivePositionLoss(t *testing.T) {
 				profile.PromptCache.Mode = capabilities.PromptCacheOpenAI56
 				return profile
 			},
-			code: canonical.DiagnosticCacheBreakpointUnsupported,
-			path: "turns.0.content.0.extensions.prompt_cache_breakpoint",
+			code:      canonical.DiagnosticCacheBreakpointUnsupported,
+			path:      "turns.0.content.0.extensions.prompt_cache_breakpoint",
+			modeAware: true,
 		},
 		{
 			name: "top-level directive on part",
@@ -829,8 +943,15 @@ func TestEncodeRequestRejectsCanonicalCacheDirectivePositionLoss(t *testing.T) {
 						Mode:        mode,
 						Profile:     test.profile(),
 					})
-					if result.OK || result.Value != nil {
-						t.Fatalf("invalid cache directive position unexpectedly succeeded: %#v", result)
+					wantOK := test.modeAware && mode != canonical.ModeStrict
+					if result.OK != wantOK {
+						t.Fatalf("EncodeRequest().OK = %v, want %v: %#v", result.OK, wantOK, result)
+					}
+					if wantOK && result.Value == nil {
+						t.Fatalf("EncodeRequest().Value = nil: %#v", result)
+					}
+					if !wantOK && result.Value != nil {
+						t.Fatalf("EncodeRequest().Value = %#v, want nil", result.Value)
 					}
 					assertDiagnosticCode(t, result.Diagnostics, test.code)
 					if test.path != "" && !hasDiagnosticPath(result.Diagnostics, test.code, test.path) {
@@ -851,10 +972,11 @@ func TestEncodeRequestValidatesCacheExtensionsOnOmittedTurns(t *testing.T) {
 		}
 	}
 	tests := []struct {
-		name  string
-		turns []canonical.Turn
-		code  canonical.DiagnosticCode
-		path  string
+		name      string
+		turns     []canonical.Turn
+		code      canonical.DiagnosticCode
+		path      string
+		modeAware bool
 	}{
 		{
 			name: "malformed breakpoint on omitted mid-conversation instruction",
@@ -870,8 +992,9 @@ func TestEncodeRequestValidatesCacheExtensionsOnOmittedTurns(t *testing.T) {
 				{Kind: canonical.TurnMessage, Role: canonical.RoleUser, Content: []canonical.Part{{Kind: canonical.PartText, Text: "hello"}}},
 				{Kind: canonical.TurnMessage, Role: canonical.RoleDeveloper, Content: []canonical.Part{partWithBreakpoint(json.RawMessage(`{"mode":"explicit"}`))}},
 			},
-			code: canonical.DiagnosticCacheBreakpointUnsupported,
-			path: "turns.1.content.0.extensions.prompt_cache_breakpoint",
+			code:      canonical.DiagnosticCacheBreakpointUnsupported,
+			path:      "turns.1.content.0.extensions.prompt_cache_breakpoint",
+			modeAware: true,
 		},
 		{
 			name: "malformed breakpoint on unknown turn",
@@ -906,8 +1029,9 @@ func TestEncodeRequestValidatesCacheExtensionsOnOmittedTurns(t *testing.T) {
 					}},
 				},
 			},
-			code: canonical.DiagnosticCacheBreakpointUnsupported,
-			path: "turns.1.results.0.content.0.extensions.prompt_cache_breakpoint",
+			code:      canonical.DiagnosticCacheBreakpointUnsupported,
+			path:      "turns.1.results.0.content.0.extensions.prompt_cache_breakpoint",
+			modeAware: true,
 		},
 	}
 
@@ -922,8 +1046,15 @@ func TestEncodeRequestValidatesCacheExtensionsOnOmittedTurns(t *testing.T) {
 						Mode:        mode,
 						Profile:     profile,
 					})
-					if result.OK || result.Value != nil {
-						t.Fatalf("omitted cache directive unexpectedly succeeded: %#v", result)
+					wantOK := test.modeAware && mode != canonical.ModeStrict
+					if result.OK != wantOK {
+						t.Fatalf("EncodeRequest().OK = %v, want %v: %#v", result.OK, wantOK, result)
+					}
+					if wantOK && result.Value == nil {
+						t.Fatalf("EncodeRequest().Value = nil: %#v", result)
+					}
+					if !wantOK && result.Value != nil {
+						t.Fatalf("EncodeRequest().Value = %#v, want nil", result.Value)
 					}
 					assertDiagnosticCode(t, result.Diagnostics, test.code)
 					if test.path != "" && !hasDiagnosticPath(result.Diagnostics, test.code, test.path) {

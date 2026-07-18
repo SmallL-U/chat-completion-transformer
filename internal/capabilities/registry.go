@@ -136,8 +136,10 @@ func (r *Registry) RegisterProfile(profile Profile) error {
 
 func validatePromptCache(profile Profile) error {
 	cache := profile.PromptCache
-	if cache.Mode != PromptCacheOpenAILegacy && (cache.InMemoryRetention || cache.ExtendedRetention24h) {
-		return fmt.Errorf("%w: prompt cache retention flags require mode %q", ErrInvalidProfile, PromptCacheOpenAILegacy)
+	hasRetention := cache.InMemoryRetention || cache.ExtendedRetention24h
+	isOpenAI := cache.Mode == PromptCacheOpenAILegacy || cache.Mode == PromptCacheOpenAI56
+	if hasRetention && !isOpenAI {
+		return fmt.Errorf("%w: prompt cache retention flags require an OpenAI prompt cache mode", ErrInvalidProfile)
 	}
 
 	switch cache.Mode {

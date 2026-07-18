@@ -37,13 +37,13 @@ func TestNewValidatesConfiguration(t *testing.T) {
 			}}},
 		},
 		{
-			name: "retention outside legacy cache mode",
+			name: "retention outside OpenAI cache mode",
 			config: Config{Profiles: []CapabilityProfile{{
 				Provider: ProviderOpenAI,
 				Endpoint: EndpointResponses,
 				Model:    "x",
 				PromptCache: PromptCacheCapabilities{
-					Mode:              PromptCacheOpenAI56,
+					Mode:              PromptCacheNone,
 					InMemoryRetention: true,
 				},
 			}}},

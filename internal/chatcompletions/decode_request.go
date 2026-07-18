@@ -62,11 +62,13 @@ func DecodeRequest(input []byte) canonical.Result[canonical.Request] {
 	request.Metadata = decodeMetadata(take(object, "metadata"), &diagnostics)
 	cacheExtensions := takeExtensions(
 		object,
-		"cache_control",
 		"prompt_cache_key",
 		"prompt_cache_options",
 		"prompt_cache_retention",
 	)
+	validateTopLevelPromptCacheExtensions(cacheExtensions, &diagnostics)
+	validatePredictionCacheDirectives(object["prediction"], &diagnostics)
+	rejectKnownTopLevelNestedCacheDirectives(object, &diagnostics)
 	rejectCacheDirectives(object, "", &diagnostics)
 
 	if request.CandidateCount != nil && *request.CandidateCount < 1 {
@@ -178,8 +180,12 @@ func decodeMessage(raw json.RawMessage, index int, diagnostics *[]canonical.Diag
 	turn := canonical.Turn{
 		Kind:    canonical.TurnMessage,
 		Role:    role,
-		Content: decodeContent(take(object, "content"), path+".content", diagnostics),
+		Content: decodeContent(take(object, "content"), path+".content", roleName, diagnostics),
 		Name:    optional[string](take(object, "name"), path+".name", diagnostics),
+	}
+	validateMessageContentParts(turn.Content, roleName, path+".content", diagnostics)
+	if role == canonical.RoleAssistant {
+		rejectAssistantNestedCacheDirectives(object, path, diagnostics)
 	}
 	rejectCacheDirectives(object, path, diagnostics)
 
@@ -214,8 +220,9 @@ func decodeToolResult(raw json.RawMessage, index int, diagnostics *[]canonical.D
 	delete(object, "role")
 	result := canonical.ToolResult{
 		CallID:  requiredString(take(object, "tool_call_id"), path+".tool_call_id", diagnostics),
-		Content: decodeContent(take(object, "content"), path+".content", diagnostics),
+		Content: decodeContent(take(object, "content"), path+".content", "tool", diagnostics),
 	}
+	validateMessageContentParts(result.Content, "tool", path+".content", diagnostics)
 	rejectCacheDirectives(object, path, diagnostics)
 	if len(result.Content) == 0 {
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "tool message content is required", path+".content", nil))
@@ -228,7 +235,7 @@ func decodeToolResult(raw json.RawMessage, index int, diagnostics *[]canonical.D
 	return result
 }
 
-func decodeContent(raw json.RawMessage, path string, diagnostics *[]canonical.Diagnostic) []canonical.Part {
+func decodeContent(raw json.RawMessage, path, role string, diagnostics *[]canonical.Diagnostic) []canonical.Part {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil
@@ -251,12 +258,12 @@ func decodeContent(raw json.RawMessage, path string, diagnostics *[]canonical.Di
 
 	parts := make([]canonical.Part, 0, len(blocks))
 	for index, block := range blocks {
-		parts = append(parts, decodeContentBlock(block, fmt.Sprintf("%s.%d", path, index), diagnostics)...)
+		parts = append(parts, decodeContentBlock(block, fmt.Sprintf("%s.%d", path, index), role, diagnostics)...)
 	}
 	return parts
 }
 
-func decodeContentBlock(raw json.RawMessage, path string, diagnostics *[]canonical.Diagnostic) []canonical.Part {
+func decodeContentBlock(raw json.RawMessage, path, role string, diagnostics *[]canonical.Diagnostic) []canonical.Part {
 	object, err := canonical.DecodeObject(raw)
 	if err != nil {
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "content part must be an object", path, raw))
@@ -282,7 +289,8 @@ func decodeContentBlock(raw json.RawMessage, path string, diagnostics *[]canonic
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityWarning, canonical.DiagnosticUnsupportedContentPart, fmt.Sprintf("content part type %q is preserved as opaque", typeName), path, raw))
 		return []canonical.Part{opaqueChatPart(raw)}
 	}
-	cacheExtensions := takeExtensions(object, "cache_control", "prompt_cache_breakpoint")
+	cacheExtensions := takeExtensions(object, "prompt_cache_breakpoint")
+	validatePartPromptCacheBreakpoint(cacheExtensions, role, typeName, path, diagnostics)
 	rejectCacheDirectives(object, path, diagnostics)
 	part.Extensions = cacheExtensions
 
@@ -387,6 +395,9 @@ func decodeToolCalls(raw json.RawMessage, path string, content []canonical.Part,
 		rejectCacheDirectives(object, callPath, diagnostics)
 		typeName := requiredString(take(object, "type"), callPath+".type", diagnostics)
 		if typeName != "function" {
+			if typeName == "custom" {
+				rejectCustomToolNestedCacheDirectives(object, callPath, diagnostics)
+			}
 			content = append(content, canonical.Part{Kind: canonical.PartOpaque, Provider: "chat_completions.tool_call", Value: cloneRaw(value)})
 			*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityWarning, diagnosticUnsupportedToolType, fmt.Sprintf("tool call type %q is preserved as opaque", typeName), callPath, value))
 			continue
@@ -442,13 +453,15 @@ func decodeTools(raw json.RawMessage, extensions canonical.Object, diagnostics *
 		typeName := requiredString(take(object, "type"), path+".type", diagnostics)
 		if typeName != "function" {
 			rejectCacheDirectives(object, path, diagnostics)
+			if typeName == "custom" {
+				rejectCustomToolNestedCacheDirectives(object, path, diagnostics)
+			}
 			preserveRaw = true
 			unsupported = append(unsupported, cloneRaw(value))
 			*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityWarning, diagnosticUnsupportedToolType, fmt.Sprintf("tool type %q cannot be represented as a canonical function tool", typeName), path, value))
 			continue
 		}
 
-		cacheExtensions := takeExtensions(object, "cache_control")
 		rejectCacheDirectives(object, path, diagnostics)
 		functionRaw := take(object, "function")
 		function, err := canonical.DecodeObject(functionRaw)
@@ -470,7 +483,6 @@ func decodeTools(raw json.RawMessage, extensions canonical.Object, diagnostics *
 			Description: optional[string](take(function, "description"), path+".function.description", diagnostics),
 			InputSchema: schema,
 			Strict:      optional[bool](take(function, "strict"), path+".function.strict", diagnostics),
-			Extensions:  cacheExtensions,
 		})
 		if len(object) > 0 || len(function) > 0 {
 			preserveRaw = true
@@ -513,7 +525,14 @@ func decodeToolChoice(raw json.RawMessage, extensions canonical.Object, diagnost
 	}
 	rejectCacheDirectives(object, "tool_choice", diagnostics)
 	typeRaw := take(object, "type")
-	if requiredString(typeRaw, "tool_choice.type", diagnostics) != "function" {
+	typeName := requiredString(typeRaw, "tool_choice.type", diagnostics)
+	if typeName == "custom" {
+		rejectCustomToolNestedCacheDirectives(object, "tool_choice", diagnostics)
+	}
+	if typeName == "allowed_tools" {
+		rejectAllowedToolsNestedCacheDirectives(object, diagnostics)
+	}
+	if typeName != "function" {
 		*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "only named function tool_choice is supported", "tool_choice.type", typeRaw))
 		return nil
 	}
@@ -677,6 +696,352 @@ func defaultInputSchema() canonical.Object {
 		"type":       json.RawMessage(`"object"`),
 		"properties": json.RawMessage(`{}`),
 	}
+}
+
+func validateTopLevelPromptCacheExtensions(extensions canonical.Object, diagnostics *[]canonical.Diagnostic) {
+	for _, name := range []string{"prompt_cache_key", "prompt_cache_options", "prompt_cache_retention"} {
+		raw, exists := extensions[name]
+		if !exists {
+			continue
+		}
+
+		var err error
+		switch name {
+		case "prompt_cache_key":
+			_, err = decodePromptCacheString(raw, name)
+		case "prompt_cache_options":
+			err = validatePromptCacheOptions(raw)
+		case "prompt_cache_retention":
+			err = validatePromptCacheRetention(raw)
+		}
+		if err == nil {
+			continue
+		}
+		*diagnostics = append(*diagnostics, diagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheControl,
+			err.Error(),
+			name,
+			raw,
+		))
+	}
+}
+
+func validatePromptCacheOptions(raw json.RawMessage) error {
+	object, err := canonical.DecodeObject(raw)
+	if err != nil {
+		return fmt.Errorf("prompt_cache_options must be an object: %w", err)
+	}
+	for name := range object {
+		if name != "mode" && name != "ttl" {
+			return fmt.Errorf("prompt_cache_options contains unsupported field %q", name)
+		}
+	}
+
+	if modeRaw, exists := object["mode"]; exists {
+		mode, decodeErr := decodePromptCacheString(modeRaw, "prompt_cache_options.mode")
+		if decodeErr != nil {
+			return decodeErr
+		}
+		if mode != "implicit" && mode != "explicit" {
+			return fmt.Errorf("prompt_cache_options.mode must be %q or %q", "implicit", "explicit")
+		}
+	}
+	if ttlRaw, exists := object["ttl"]; exists {
+		ttl, decodeErr := decodePromptCacheString(ttlRaw, "prompt_cache_options.ttl")
+		if decodeErr != nil {
+			return decodeErr
+		}
+		if ttl != "30m" {
+			return fmt.Errorf("prompt_cache_options.ttl must be %q", "30m")
+		}
+	}
+	return nil
+}
+
+func validatePromptCacheRetention(raw json.RawMessage) error {
+	retention, err := decodePromptCacheString(raw, "prompt_cache_retention")
+	if err != nil {
+		return err
+	}
+	if retention != "in_memory" && retention != "24h" {
+		return fmt.Errorf("prompt_cache_retention must be %q or %q", "in_memory", "24h")
+	}
+	return nil
+}
+
+func validatePromptCacheBreakpoint(raw json.RawMessage) error {
+	object, err := canonical.DecodeObject(raw)
+	if err != nil {
+		return fmt.Errorf("prompt_cache_breakpoint must be an object: %w", err)
+	}
+	for name := range object {
+		if name != "mode" {
+			return fmt.Errorf("prompt_cache_breakpoint contains unsupported field %q", name)
+		}
+	}
+
+	modeRaw, exists := object["mode"]
+	if !exists {
+		return fmt.Errorf("prompt_cache_breakpoint.mode is required")
+	}
+	mode, err := decodePromptCacheString(modeRaw, "prompt_cache_breakpoint.mode")
+	if err != nil {
+		return err
+	}
+	if mode != "explicit" {
+		return fmt.Errorf("prompt_cache_breakpoint.mode must be %q", "explicit")
+	}
+	return nil
+}
+
+func decodePromptCacheString(raw json.RawMessage, path string) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", fmt.Errorf("%s must be a string", path)
+	}
+	var value string
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return "", fmt.Errorf("%s must be a string", path)
+	}
+	return value, nil
+}
+
+func validatePartPromptCacheBreakpoint(extensions canonical.Object, role, typeName, path string, diagnostics *[]canonical.Diagnostic) {
+	raw, exists := extensions["prompt_cache_breakpoint"]
+	if !exists {
+		return
+	}
+	fieldPath := path + ".prompt_cache_breakpoint"
+	if err := validatePromptCacheBreakpoint(raw); err != nil {
+		*diagnostics = append(*diagnostics, diagnostic(
+			canonical.SeverityError,
+			canonical.DiagnosticInvalidCacheControl,
+			err.Error(),
+			fieldPath,
+			raw,
+		))
+		return
+	}
+	if promptCacheBreakpointAllowed(role, typeName) {
+		return
+	}
+	*diagnostics = append(*diagnostics, diagnostic(
+		canonical.SeverityError,
+		canonical.DiagnosticCacheBreakpointUnsupported,
+		fmt.Sprintf("prompt_cache_breakpoint is not valid on %s %s content parts", role, typeName),
+		fieldPath,
+		raw,
+	))
+}
+
+func promptCacheBreakpointAllowed(role, typeName string) bool {
+	switch role {
+	case "developer", "system", "assistant", "tool", "prediction":
+		return typeName == "text"
+	case "user":
+		return typeName == "text" || typeName == "image_url" || typeName == "input_audio" || typeName == "file"
+	default:
+		return false
+	}
+}
+
+func validateMessageContentParts(parts []canonical.Part, role, path string, diagnostics *[]canonical.Diagnostic) {
+	typed := make([]canonical.Part, 0, len(parts))
+	for _, part := range parts {
+		if part.Kind == canonical.PartOpaque {
+			continue
+		}
+		typed = append(typed, part)
+	}
+	if len(typed) == 0 {
+		return
+	}
+
+	valid := true
+	switch role {
+	case "developer", "system", "tool":
+		valid = allPartsOfKind(typed, canonical.PartText)
+	case "user":
+		for _, part := range typed {
+			if part.Kind == canonical.PartText || part.Kind == canonical.PartImage || part.Kind == canonical.PartAudio || part.Kind == canonical.PartFile {
+				continue
+			}
+			valid = false
+			break
+		}
+	case "assistant":
+		if allPartsOfKind(typed, canonical.PartText) {
+			return
+		}
+		valid = len(typed) == 1 && typed[0].Kind == canonical.PartRefusal
+	default:
+		return
+	}
+	if valid {
+		return
+	}
+	*diagnostics = append(*diagnostics, diagnostic(
+		canonical.SeverityError,
+		diagnosticInvalidRequest,
+		fmt.Sprintf("content parts are not valid for %s messages", role),
+		path,
+		nil,
+	))
+}
+
+func allPartsOfKind(parts []canonical.Part, kind canonical.PartKind) bool {
+	for _, part := range parts {
+		if part.Kind != kind {
+			return false
+		}
+	}
+	return true
+}
+
+func validatePredictionCacheDirectives(raw json.RawMessage, diagnostics *[]canonical.Diagnostic) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return
+	}
+	prediction, err := canonical.DecodeObject(raw)
+	if err != nil {
+		*diagnostics = append(*diagnostics, diagnostic(
+			canonical.SeverityError,
+			diagnosticInvalidRequest,
+			"prediction must be an object",
+			"prediction",
+			raw,
+		))
+		return
+	}
+
+	typeRaw := take(prediction, "type")
+	typeName, typeErr := decodePromptCacheString(typeRaw, "prediction.type")
+	if typeErr != nil || typeName != "content" {
+		*diagnostics = append(*diagnostics, diagnostic(
+			canonical.SeverityError,
+			diagnosticInvalidRequest,
+			"prediction.type must be \"content\"",
+			"prediction.type",
+			typeRaw,
+		))
+	}
+	contentRaw := take(prediction, "content")
+	rejectCacheDirectives(prediction, "prediction", diagnostics)
+	content := bytes.TrimSpace(contentRaw)
+	if len(content) == 0 || bytes.Equal(content, []byte("null")) {
+		*diagnostics = append(*diagnostics, diagnostic(
+			canonical.SeverityError,
+			diagnosticInvalidRequest,
+			"prediction.content is required",
+			"prediction.content",
+			contentRaw,
+		))
+		return
+	}
+	if content[0] == '"' {
+		if _, err := decodePromptCacheString(contentRaw, "prediction.content"); err != nil {
+			*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, err.Error(), "prediction.content", contentRaw))
+		}
+		return
+	}
+
+	var parts []json.RawMessage
+	if err := json.Unmarshal(content, &parts); err != nil || parts == nil {
+		*diagnostics = append(*diagnostics, diagnostic(
+			canonical.SeverityError,
+			diagnosticInvalidRequest,
+			"prediction.content must be a string or an array of text content parts",
+			"prediction.content",
+			contentRaw,
+		))
+		return
+	}
+	for index, partRaw := range parts {
+		path := fmt.Sprintf("prediction.content.%d", index)
+		part, decodeErr := canonical.DecodeObject(partRaw)
+		if decodeErr != nil {
+			*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "prediction content part must be an object", path, partRaw))
+			continue
+		}
+		typeRaw := take(part, "type")
+		typeName, typeErr := decodePromptCacheString(typeRaw, path+".type")
+		if typeErr != nil || typeName != "text" {
+			*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, "prediction content parts must have type \"text\"", path+".type", typeRaw))
+		}
+		textRaw := take(part, "text")
+		if _, textErr := decodePromptCacheString(textRaw, path+".text"); textErr != nil {
+			*diagnostics = append(*diagnostics, diagnostic(canonical.SeverityError, diagnosticInvalidRequest, textErr.Error(), path+".text", textRaw))
+		}
+		extensions := takeExtensions(part, "prompt_cache_breakpoint")
+		validatePartPromptCacheBreakpoint(extensions, "prediction", typeName, path, diagnostics)
+		rejectCacheDirectives(part, path, diagnostics)
+	}
+}
+
+func rejectKnownTopLevelNestedCacheDirectives(object canonical.Object, diagnostics *[]canonical.Diagnostic) {
+	audio := rejectCacheDirectivesInObject(object["audio"], "audio", diagnostics)
+	rejectCacheDirectivesInObject(audio["voice"], "audio.voice", diagnostics)
+	rejectCacheDirectivesInObject(object["function_call"], "function_call", diagnostics)
+	rejectCacheDirectivesInObjectArray(object["functions"], "functions", diagnostics)
+
+	moderation := rejectCacheDirectivesInObject(object["moderation"], "moderation", diagnostics)
+	policy := rejectCacheDirectivesInObject(moderation["policy"], "moderation.policy", diagnostics)
+	rejectCacheDirectivesInObject(policy["input"], "moderation.policy.input", diagnostics)
+	rejectCacheDirectivesInObject(policy["output"], "moderation.policy.output", diagnostics)
+
+	webSearch := rejectCacheDirectivesInObject(object["web_search_options"], "web_search_options", diagnostics)
+	location := rejectCacheDirectivesInObject(webSearch["user_location"], "web_search_options.user_location", diagnostics)
+	rejectCacheDirectivesInObject(location["approximate"], "web_search_options.user_location.approximate", diagnostics)
+}
+
+func rejectAssistantNestedCacheDirectives(object canonical.Object, path string, diagnostics *[]canonical.Diagnostic) {
+	rejectCacheDirectivesInObject(object["audio"], path+".audio", diagnostics)
+	rejectCacheDirectivesInObject(object["function_call"], path+".function_call", diagnostics)
+}
+
+func rejectCustomToolNestedCacheDirectives(object canonical.Object, path string, diagnostics *[]canonical.Diagnostic) {
+	custom := rejectCacheDirectivesInObject(object["custom"], path+".custom", diagnostics)
+	format := rejectCacheDirectivesInObject(custom["format"], path+".custom.format", diagnostics)
+	rejectCacheDirectivesInObject(format["grammar"], path+".custom.format.grammar", diagnostics)
+}
+
+func rejectAllowedToolsNestedCacheDirectives(object canonical.Object, diagnostics *[]canonical.Diagnostic) {
+	allowed := rejectCacheDirectivesInObject(object["allowed_tools"], "tool_choice.allowed_tools", diagnostics)
+	tools := rejectCacheDirectivesInObjectArray(allowed["tools"], "tool_choice.allowed_tools.tools", diagnostics)
+	for index, tool := range tools {
+		path := fmt.Sprintf("tool_choice.allowed_tools.tools.%d", index)
+		rejectCacheDirectivesInObject(tool["function"], path+".function", diagnostics)
+		rejectCustomToolNestedCacheDirectives(tool, path, diagnostics)
+	}
+}
+
+func rejectCacheDirectivesInObject(raw json.RawMessage, path string, diagnostics *[]canonical.Diagnostic) canonical.Object {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	object, err := canonical.DecodeObject(raw)
+	if err != nil {
+		return nil
+	}
+	rejectCacheDirectives(object, path, diagnostics)
+	return object
+}
+
+func rejectCacheDirectivesInObjectArray(raw json.RawMessage, path string, diagnostics *[]canonical.Diagnostic) []canonical.Object {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	var values []json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil
+	}
+	objects := make([]canonical.Object, 0, len(values))
+	for index, value := range values {
+		objects = append(objects, rejectCacheDirectivesInObject(value, fmt.Sprintf("%s.%d", path, index), diagnostics))
+	}
+	return objects
 }
 
 func take(object canonical.Object, key string) json.RawMessage {

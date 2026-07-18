@@ -220,7 +220,7 @@ func TestRouterForwardsPromptCacheControlsByProfile(t *testing.T) {
 		path string
 		body json.RawMessage
 	}
-	captured := make(chan capturedRequest, 3)
+	captured := make(chan capturedRequest, 5)
 	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		body, err := io.ReadAll(request.Body)
 		if err != nil {
@@ -247,17 +247,36 @@ func TestRouterForwardsPromptCacheControlsByProfile(t *testing.T) {
 		assertBody func(*testing.T, json.RawMessage)
 	}{
 		{
-			name: "Anthropic top-level content and tool controls",
+			name: "Anthropic explicit breakpoint",
 			body: `{
 				"model":"anthropic-cache",
-				"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"},"prompt_cache_breakpoint":{"mode":"explicit"}}]}],
-				"tools":[{"type":"function","cache_control":{"type":"ephemeral"},"function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}],
-				"cache_control":{"type":"ephemeral"},
-				"prompt_cache_key":"must-not-leak",
+				"messages":[{"role":"user","content":[{"type":"text","text":"hello","prompt_cache_breakpoint":{"mode":"explicit"}}]}],
+				"prompt_cache_options":{"mode":"explicit","ttl":"30m"},
 				"max_completion_tokens":12
 			}`,
 			wantPath:   "/v1/messages",
-			assertBody: assertAnthropicPromptCacheRequest,
+			assertBody: assertAnthropicExplicitPromptCacheRequest,
+		},
+		{
+			name: "Anthropic implicit breakpoint",
+			body: `{
+				"model":"anthropic-cache",
+				"messages":[{"role":"user","content":"hello"}],
+				"prompt_cache_options":{"mode":"implicit"},
+				"max_completion_tokens":12
+			}`,
+			wantPath:   "/v1/messages",
+			assertBody: assertAnthropicImplicitPromptCacheRequest,
+		},
+		{
+			name: "Anthropic request without cache controls",
+			body: `{
+				"model":"anthropic-cache",
+				"messages":[{"role":"user","content":"hello"}],
+				"max_completion_tokens":12
+			}`,
+			wantPath:   "/v1/messages",
+			assertBody: assertAnthropicPromptCacheAbsent,
 		},
 		{
 			name: "OpenAI legacy top-level controls",
@@ -265,8 +284,7 @@ func TestRouterForwardsPromptCacheControlsByProfile(t *testing.T) {
 				"model":"openai-legacy-cache",
 				"messages":[{"role":"user","content":"hello"}],
 				"prompt_cache_key":"tenant:legacy",
-				"prompt_cache_retention":"in_memory",
-				"cache_control":{"type":"ephemeral"}
+				"prompt_cache_retention":"in_memory"
 			}`,
 			wantPath:   "/v1/responses",
 			assertBody: assertOpenAILegacyPromptCacheRequest,
@@ -275,11 +293,9 @@ func TestRouterForwardsPromptCacheControlsByProfile(t *testing.T) {
 			name: "OpenAI 5.6 top-level controls and breakpoint",
 			body: `{
 				"model":"openai-56-cache",
-				"messages":[{"role":"user","content":[{"type":"text","text":"hello","prompt_cache_breakpoint":{"mode":"explicit"},"cache_control":{"type":"ephemeral"}}]}],
-				"tools":[{"type":"function","cache_control":{"type":"ephemeral"},"function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}],
+				"messages":[{"role":"user","content":[{"type":"text","text":"hello","prompt_cache_breakpoint":{"mode":"explicit"}}]}],
 				"prompt_cache_key":"tenant:56",
-				"prompt_cache_options":{"mode":"explicit","ttl":"30m"},
-				"cache_control":{"type":"ephemeral"}
+				"prompt_cache_options":{"mode":"explicit","ttl":"30m"}
 			}`,
 			wantPath:   "/v1/responses",
 			assertBody: assertOpenAI56PromptCacheRequest,
@@ -302,6 +318,118 @@ func TestRouterForwardsPromptCacheControlsByProfile(t *testing.T) {
 			test.assertBody(t, upstreamRequest.body)
 		})
 	}
+}
+
+func TestRouterForwardsPromptCacheControlsForStreams(t *testing.T) {
+	type capturedRequest struct {
+		path string
+		body json.RawMessage
+	}
+	captured := make(chan capturedRequest, 2)
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Errorf("read upstream request: %v", err)
+			writer.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		captured <- capturedRequest{path: request.URL.Path, body: body}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		if request.URL.Path == "/v1/messages" {
+			_, _ = io.WriteString(writer, anthropicTextStream())
+			return
+		}
+		_, _ = io.WriteString(writer, responsesTextStream())
+	}))
+	defer provider.Close()
+	profiles, routes, upstreamRoutes := promptCacheTestConfiguration()
+	router := newPromptCacheTestRouter(t, provider.URL, transformer.ModeCompatible, profiles, routes, upstreamRoutes, nil)
+
+	tests := []struct {
+		name       string
+		body       string
+		wantPath   string
+		assertBody func(*testing.T, json.RawMessage)
+	}{
+		{
+			name: "Anthropic",
+			body: `{
+				"model":"anthropic-cache",
+				"messages":[{"role":"user","content":[{"type":"text","text":"hello","prompt_cache_breakpoint":{"mode":"explicit"}}]}],
+				"prompt_cache_options":{"mode":"explicit","ttl":"30m"},
+				"stream":true
+			}`,
+			wantPath:   "/v1/messages",
+			assertBody: assertAnthropicExplicitPromptCacheRequest,
+		},
+		{
+			name: "OpenAI",
+			body: `{
+				"model":"openai-56-cache",
+				"messages":[{"role":"user","content":[{"type":"text","text":"hello","prompt_cache_breakpoint":{"mode":"explicit"}}]}],
+				"prompt_cache_key":"tenant:56",
+				"prompt_cache_options":{"mode":"explicit","ttl":"30m"},
+				"stream":true
+			}`,
+			wantPath:   "/v1/responses",
+			assertBody: assertOpenAI56PromptCacheRequest,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(test.body))
+			request.Header.Set("Authorization", "Bearer client-key")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusOK {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+			if !strings.HasSuffix(response.Body.String(), "data: [DONE]\n\n") {
+				t.Fatalf("stream has no completion marker: %s", response.Body.String())
+			}
+
+			upstreamRequest := <-captured
+			if upstreamRequest.path != test.wantPath {
+				t.Fatalf("upstream path = %q, want %q", upstreamRequest.path, test.wantPath)
+			}
+			test.assertBody(t, upstreamRequest.body)
+		})
+	}
+}
+
+func TestRouterStrictForwardsStandardPromptCacheControls(t *testing.T) {
+	var upstreamBody json.RawMessage
+	doer := httpDoerFunc(func(request *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			return nil, err
+		}
+		upstreamBody = body
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"resp_cache","model":"gpt-test","output":[{"type":"message","content":[{"type":"output_text","text":"OK"}]}]}`,
+			)),
+		}, nil
+	})
+	profiles, routes, upstreamRoutes := promptCacheTestConfiguration()
+	router := newPromptCacheTestRouter(t, "https://provider.example", transformer.ModeStrict, profiles, routes, upstreamRoutes, doer)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"openai-56-cache",
+		"messages":[{"role":"user","content":[{"type":"text","text":"hello","prompt_cache_breakpoint":{"mode":"explicit"}}]}],
+		"prompt_cache_key":"tenant:56",
+		"prompt_cache_options":{"mode":"explicit","ttl":"30m"}
+	}`))
+	request.Header.Set("Authorization", "Bearer client-key")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	assertOpenAI56PromptCacheRequest(t, upstreamBody)
 }
 
 func TestRouterPromptCacheGenerationMismatchModes(t *testing.T) {
@@ -366,35 +494,59 @@ func TestRouterPromptCacheGenerationMismatchModes(t *testing.T) {
 }
 
 func TestRouterRejectsCacheDirectiveInvalidPositionBeforeUpstream(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		wantPath string
+	}{
+		{
+			name:     "top level",
+			body:     `{"model":"anthropic-cache","messages":[{"role":"user","content":"hello"}],"cache_control":{"type":"ephemeral"}}`,
+			wantPath: "cache_control",
+		},
+		{
+			name:     "content part",
+			body:     `{"model":"anthropic-cache","messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}]}`,
+			wantPath: "messages.0.content.0.cache_control",
+		},
+		{
+			name:     "tool wrapper",
+			body:     `{"model":"openai-56-cache","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","cache_control":{"type":"ephemeral"},"function":{"name":"lookup","parameters":{"type":"object"}}}]}`,
+			wantPath: "tools.0.cache_control",
+		},
+		{
+			name:     "function body",
+			body:     `{"model":"openai-56-cache","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"},"cache_control":{"type":"ephemeral"}}}]}`,
+			wantPath: "tools.0.function.cache_control",
+		},
+	}
 	for _, mode := range []transformer.Mode{transformer.ModeStrict, transformer.ModeCompatible, transformer.ModeEmulate} {
-		t.Run(string(mode), func(t *testing.T) {
-			var calls atomic.Int64
-			doer := httpDoerFunc(func(*http.Request) (*http.Response, error) {
-				calls.Add(1)
-				return nil, errors.New("upstream must not be called")
+		for _, test := range tests {
+			t.Run(string(mode)+"/"+test.name, func(t *testing.T) {
+				var calls atomic.Int64
+				doer := httpDoerFunc(func(*http.Request) (*http.Response, error) {
+					calls.Add(1)
+					return nil, errors.New("upstream must not be called")
+				})
+				profiles, routes, upstreamRoutes := promptCacheTestConfiguration()
+				router := newPromptCacheTestRouter(t, "https://provider.example", mode, profiles, routes, upstreamRoutes, doer)
+
+				request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(test.body))
+				request.Header.Set("Authorization", "Bearer client-key")
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+
+				if response.Code != http.StatusBadRequest {
+					t.Fatalf("response = %d %s", response.Code, response.Body.String())
+				}
+				if calls.Load() != 0 {
+					t.Fatalf("upstream calls = %d, want 0", calls.Load())
+				}
+				if !strings.Contains(response.Body.String(), string(transformer.DiagnosticInvalidCacheControl)) || !strings.Contains(response.Body.String(), test.wantPath) {
+					t.Fatalf("response = %s", response.Body.String())
+				}
 			})
-			profiles, routes, upstreamRoutes := promptCacheTestConfiguration()
-			router := newPromptCacheTestRouter(t, "https://provider.example", mode, profiles, routes, upstreamRoutes, doer)
-
-			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
-				"model":"openai-56-cache",
-				"messages":[{"role":"user","content":"hello"}],
-				"tools":[{"type":"function","function":{"name":"lookup","cache_control":{"type":"ephemeral"}}}]
-			}`))
-			request.Header.Set("Authorization", "Bearer client-key")
-			response := httptest.NewRecorder()
-			router.ServeHTTP(response, request)
-
-			if response.Code != http.StatusBadRequest {
-				t.Fatalf("response = %d %s", response.Code, response.Body.String())
-			}
-			if calls.Load() != 0 {
-				t.Fatalf("upstream calls = %d, want 0", calls.Load())
-			}
-			if !strings.Contains(response.Body.String(), string(transformer.DiagnosticInvalidCacheControl)) {
-				t.Fatalf("response = %s", response.Body.String())
-			}
-		})
+		}
 	}
 }
 
@@ -1317,11 +1469,11 @@ func promptCacheTestConfiguration() ([]transformer.CapabilityProfile, []transfor
 	return profiles, routes, upstreamRoutes
 }
 
-func assertAnthropicPromptCacheRequest(t *testing.T, raw json.RawMessage) {
+func assertAnthropicExplicitPromptCacheRequest(t *testing.T, raw json.RawMessage) {
 	t.Helper()
 	object := decodeTestJSONObject(t, raw)
 	assertTestJSONField(t, object, "model", `"anthropic-cache-target"`)
-	assertTestJSONField(t, object, "cache_control", `{"type":"ephemeral"}`)
+	assertTestJSONFieldAbsent(t, object, "cache_control")
 	assertTestJSONFieldAbsent(t, object, "prompt_cache_key")
 	assertTestJSONFieldAbsent(t, object, "prompt_cache_options")
 	assertTestJSONFieldAbsent(t, object, "prompt_cache_retention")
@@ -1330,12 +1482,29 @@ func assertAnthropicPromptCacheRequest(t *testing.T, raw json.RawMessage) {
 	message := decodeTestJSONObject(t, requireTestJSONArrayElement(t, messages, 0))
 	content := decodeTestJSONArray(t, requireTestJSONField(t, message, "content"))
 	part := decodeTestJSONObject(t, requireTestJSONArrayElement(t, content, 0))
-	assertTestJSONField(t, part, "cache_control", `{"type":"ephemeral"}`)
+	assertTestJSONField(t, part, "cache_control", `{"type":"ephemeral","ttl":"1h"}`)
 	assertTestJSONFieldAbsent(t, part, "prompt_cache_breakpoint")
+	assertTestJSONFieldAbsent(t, object, "tools")
+}
 
-	tools := decodeTestJSONArray(t, requireTestJSONField(t, object, "tools"))
-	tool := decodeTestJSONObject(t, requireTestJSONArrayElement(t, tools, 0))
-	assertTestJSONField(t, tool, "cache_control", `{"type":"ephemeral"}`)
+func assertAnthropicImplicitPromptCacheRequest(t *testing.T, raw json.RawMessage) {
+	t.Helper()
+	object := decodeTestJSONObject(t, raw)
+	assertTestJSONField(t, object, "model", `"anthropic-cache-target"`)
+	assertTestJSONField(t, object, "cache_control", `{"type":"ephemeral","ttl":"1h"}`)
+	assertTestJSONFieldAbsent(t, object, "prompt_cache_key")
+	assertTestJSONFieldAbsent(t, object, "prompt_cache_options")
+	assertTestJSONFieldAbsent(t, object, "prompt_cache_retention")
+}
+
+func assertAnthropicPromptCacheAbsent(t *testing.T, raw json.RawMessage) {
+	t.Helper()
+	object := decodeTestJSONObject(t, raw)
+	assertTestJSONField(t, object, "model", `"anthropic-cache-target"`)
+	assertTestJSONFieldAbsent(t, object, "cache_control")
+	assertTestJSONFieldAbsent(t, object, "prompt_cache_key")
+	assertTestJSONFieldAbsent(t, object, "prompt_cache_options")
+	assertTestJSONFieldAbsent(t, object, "prompt_cache_retention")
 }
 
 func assertOpenAILegacyPromptCacheRequest(t *testing.T, raw json.RawMessage) {
@@ -1363,10 +1532,6 @@ func assertOpenAI56PromptCacheRequest(t *testing.T, raw json.RawMessage) {
 	part := decodeTestJSONObject(t, requireTestJSONArrayElement(t, content, 0))
 	assertTestJSONField(t, part, "prompt_cache_breakpoint", `{"mode":"explicit"}`)
 	assertTestJSONFieldAbsent(t, part, "cache_control")
-
-	tools := decodeTestJSONArray(t, requireTestJSONField(t, object, "tools"))
-	tool := decodeTestJSONObject(t, requireTestJSONArrayElement(t, tools, 0))
-	assertTestJSONFieldAbsent(t, tool, "cache_control")
 }
 
 func decodeTestJSONObject(t *testing.T, raw json.RawMessage) map[string]json.RawMessage {

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strings"
 
 	"chat-completion-transformer/internal/assets"
 	"chat-completion-transformer/internal/canonical"
@@ -51,6 +50,23 @@ type anthropicCacheBlock struct {
 	control *anthropicCacheControl
 }
 
+type anthropicPromptCachePlan struct {
+	active              bool
+	automatic           bool
+	ttl                 *string
+	automaticPath       string
+	selectedBreakpoints map[string]struct{}
+}
+
+type promptCacheBreakpoint struct {
+	path string
+	raw  json.RawMessage
+}
+
+type openAIPromptCacheOptions struct {
+	mode string
+}
+
 type requestEncoder struct {
 	ctx         context.Context
 	options     RequestEncodeOptions
@@ -59,6 +75,7 @@ type requestEncoder struct {
 	system      []any
 	messages    []any
 	roleWarning bool
+	cachePlan   anthropicPromptCachePlan
 }
 
 // EncodeRequest converts a canonical request into an Anthropic Messages JSON
@@ -80,6 +97,7 @@ func EncodeRequest(ctx context.Context, request canonical.Request, options Reque
 	}
 	encoder := requestEncoder{ctx: ctx, options: options, resolver: resolver}
 	encoder.validateTarget()
+	encoder.cachePlan = encoder.planPromptCache(request)
 	encoder.diagnostics = append(encoder.diagnostics, canonical.ValidateToolHistory(request.Turns)...)
 	encoder.encodeTurns(request.Turns)
 
@@ -362,6 +380,7 @@ func (e *requestEncoder) encodeToolResults(turns []canonical.Turn, index int) in
 		if len(blocks) > 0 {
 			block["content"] = blocks
 		}
+		e.encodeToolResultPromptCacheBreakpoint(result, resultPath, len(blocks) > 0, block)
 		if result.IsError != nil && *result.IsError {
 			block["is_error"] = true
 		}
@@ -572,6 +591,7 @@ func (e *requestEncoder) encodeFields(request canonical.Request) map[string]any 
 	e.encodeOutputFormat(request.OutputFormat, value)
 	e.encodeMetadata(request.Metadata, value)
 	e.encodeExtensions(request.Extensions, value)
+	e.encodePlannedAutomaticCacheControl(value)
 	e.validateCacheControls(value)
 	return value
 }
@@ -888,7 +908,8 @@ func (e *requestEncoder) encodeExtensions(extensions canonical.Object, value map
 		case "cache_control":
 			e.encodeTopLevelCacheControl(extensions[key], value)
 		case "prompt_cache_key", "prompt_cache_options", "prompt_cache_retention":
-			e.encodeOpenAICacheDirective(key, extensions[key])
+			// Standard Chat Completions cache fields are consumed by
+			// planPromptCache before provider encoding.
 		case "prompt_cache_breakpoint":
 			e.addError(
 				canonical.DiagnosticCacheBreakpointUnsupported,
@@ -928,25 +949,7 @@ func (e *requestEncoder) encodePartExtensions(part canonical.Part, role canonica
 		case "cache_control":
 			e.encodePartCacheControl(raw, extensionPath, part, role, block)
 		case "prompt_cache_breakpoint":
-			if err := validateOpenAIPromptCacheBreakpoint(raw); err != nil {
-				e.addError(canonical.DiagnosticInvalidCacheControl, err.Error(), extensionPath, raw)
-				continue
-			}
-			if !validOpenAIPromptCacheBreakpointPosition(part, role) {
-				e.addError(
-					canonical.DiagnosticCacheBreakpointUnsupported,
-					"OpenAI prompt cache breakpoints are only valid on input text, image, and file blocks",
-					extensionPath,
-					raw,
-				)
-				continue
-			}
-			e.addLossy(
-				canonical.DiagnosticCacheControlProviderMismatch,
-				"OpenAI prompt cache breakpoint is not passed through to Anthropic",
-				extensionPath,
-				raw,
-			)
+			e.encodePlannedPromptCacheBreakpoint(path, extensionPath, role, block, raw)
 		case "prompt_cache_key", "prompt_cache_options", "prompt_cache_retention":
 			e.addError(
 				canonical.DiagnosticInvalidCacheControl,
@@ -960,30 +963,254 @@ func (e *requestEncoder) encodePartExtensions(part canonical.Part, role canonica
 	}
 }
 
-func (e *requestEncoder) encodeOpenAICacheDirective(name string, raw json.RawMessage) {
-	err := validateOpenAICacheDirective(name, raw)
-	path := "extensions." + name
-	if err != nil {
-		e.addError(canonical.DiagnosticInvalidCacheControl, err.Error(), path, raw)
+func (e *requestEncoder) planPromptCache(request canonical.Request) anthropicPromptCachePlan {
+	breakpoints, breakpointSignal := e.collectPromptCacheBreakpoints(request.Turns)
+
+	keyRaw, hasKey := request.Extensions["prompt_cache_key"]
+	if hasKey {
+		if err := validateOpenAICacheDirective("prompt_cache_key", keyRaw); err != nil {
+			e.addError(canonical.DiagnosticInvalidCacheControl, err.Error(), "extensions.prompt_cache_key", keyRaw)
+		} else {
+			e.addLossy(
+				canonical.DiagnosticCacheControlProviderMismatch,
+				"prompt_cache_key has no Anthropic equivalent and is not forwarded",
+				"extensions.prompt_cache_key",
+				keyRaw,
+			)
+		}
+	}
+
+	retentionRaw, hasRetention := request.Extensions["prompt_cache_retention"]
+	if hasRetention {
+		if err := validateOpenAIPromptCacheRetention(retentionRaw); err != nil {
+			e.addError(canonical.DiagnosticInvalidCacheControl, err.Error(), "extensions.prompt_cache_retention", retentionRaw)
+		} else {
+			e.addLossy(
+				canonical.DiagnosticCacheControlProviderMismatch,
+				"prompt_cache_retention has no equivalent Anthropic per-request maximum-retention policy and is not forwarded",
+				"extensions.prompt_cache_retention",
+				retentionRaw,
+			)
+		}
+	}
+
+	optionsRaw, hasOptions := request.Extensions["prompt_cache_options"]
+	if !hasOptions && breakpointSignal == nil {
+		return anthropicPromptCachePlan{}
+	}
+
+	options := openAIPromptCacheOptions{mode: "implicit"}
+	if hasOptions {
+		decoded, err := decodeOpenAIPromptCacheOptions(optionsRaw)
+		if err != nil {
+			e.addError(canonical.DiagnosticInvalidCacheControl, err.Error(), "extensions.prompt_cache_options", optionsRaw)
+			return anthropicPromptCachePlan{}
+		}
+		options = decoded
+	}
+
+	signalPath := "extensions.prompt_cache_options"
+	signalRaw := optionsRaw
+	if !hasOptions {
+		signalPath = breakpointSignal.path + ".extensions.prompt_cache_breakpoint"
+		signalRaw = breakpointSignal.raw
+	}
+	if !e.promptCacheMappingEnabled() {
+		e.addLossy(
+			canonical.DiagnosticCacheControlUnsupported,
+			"target profile does not support mapping Chat Completions prompt caching to Anthropic",
+			signalPath,
+			signalRaw,
+		)
+		return anthropicPromptCachePlan{}
+	}
+
+	limit := 4
+	if options.mode == "implicit" {
+		limit = 3
+	}
+	start := len(breakpoints) - limit
+	if start < 0 {
+		start = 0
+	}
+	selected := make(map[string]struct{}, len(breakpoints)-start)
+	for _, breakpoint := range breakpoints[start:] {
+		selected[breakpoint.path] = struct{}{}
+	}
+
+	ttl := "1h"
+	return anthropicPromptCachePlan{
+		active:              true,
+		automatic:           options.mode == "implicit",
+		ttl:                 &ttl,
+		automaticPath:       signalPath,
+		selectedBreakpoints: selected,
+	}
+}
+
+func (e *requestEncoder) collectPromptCacheBreakpoints(turns []canonical.Turn) ([]promptCacheBreakpoint, *promptCacheBreakpoint) {
+	breakpoints := make([]promptCacheBreakpoint, 0)
+	var firstSignal *promptCacheBreakpoint
+	collect := func(parts []canonical.Part, role canonical.Role, basePath string, toolResult bool) {
+		for index, part := range parts {
+			raw, exists := part.Extensions["prompt_cache_breakpoint"]
+			if !exists {
+				continue
+			}
+			partPath := fmt.Sprintf("%s.%d", basePath, index)
+			extensionPath := partPath + ".extensions.prompt_cache_breakpoint"
+			if err := validateOpenAIPromptCacheBreakpoint(raw); err != nil {
+				e.addError(canonical.DiagnosticInvalidCacheControl, err.Error(), extensionPath, raw)
+				continue
+			}
+			if !validChatPromptCacheBreakpointPosition(part, role) {
+				e.addError(
+					canonical.DiagnosticCacheBreakpointUnsupported,
+					"prompt_cache_breakpoint is not valid at this Chat Completions content position",
+					extensionPath,
+					raw,
+				)
+				continue
+			}
+			breakpoint := promptCacheBreakpoint{path: partPath, raw: raw}
+			if firstSignal == nil {
+				firstSignal = &breakpoint
+			}
+			if toolResult && index != len(parts)-1 {
+				e.addLossy(
+					canonical.DiagnosticCacheBreakpointUnsupported,
+					"a tool message breakpoint can only map to Anthropic when it is on the final content part",
+					extensionPath,
+					raw,
+				)
+				continue
+			}
+			if !anthropicPromptCacheBreakpointPosition(part, role) {
+				e.addLossy(
+					canonical.DiagnosticCacheBreakpointUnsupported,
+					"prompt_cache_breakpoint cannot be represented on this Anthropic content block",
+					extensionPath,
+					raw,
+				)
+				continue
+			}
+			breakpoints = append(breakpoints, breakpoint)
+		}
+	}
+
+	for turnIndex, turn := range turns {
+		turnPath := fmt.Sprintf("turns.%d", turnIndex)
+		if turn.Kind == canonical.TurnMessage {
+			collect(turn.Content, turn.Role, turnPath+".content", false)
+			continue
+		}
+		if turn.Kind != canonical.TurnToolResults {
+			continue
+		}
+		for resultIndex, result := range turn.Results {
+			resultPath := fmt.Sprintf("%s.results.%d.content", turnPath, resultIndex)
+			collect(result.Content, canonical.Role("tool_result"), resultPath, true)
+		}
+	}
+	return breakpoints, firstSignal
+}
+
+func (e *requestEncoder) promptCacheMappingEnabled() bool {
+	return e.options.Profile.PromptCache.Mode == capabilities.PromptCacheAnthropic &&
+		e.options.Profile.Endpoint == capabilities.EndpointMessages
+}
+
+func (e *requestEncoder) encodePlannedAutomaticCacheControl(value map[string]any) {
+	if !e.cachePlan.active || !e.cachePlan.automatic {
 		return
 	}
-	e.addLossy(
-		canonical.DiagnosticCacheControlProviderMismatch,
-		fmt.Sprintf("OpenAI cache directive %q is not passed through to Anthropic", name),
-		path,
-		raw,
-	)
+	if _, exists := value["cache_control"]; exists {
+		e.addError(
+			canonical.DiagnosticInvalidCacheControl,
+			"native cache_control conflicts with mapped Chat Completions prompt caching",
+			e.cachePlan.automaticPath,
+			nil,
+		)
+		return
+	}
+	value["cache_control"] = e.plannedCacheControl(e.cachePlan.automaticPath)
+}
+
+func (e *requestEncoder) encodePlannedPromptCacheBreakpoint(
+	partPath string,
+	extensionPath string,
+	role canonical.Role,
+	block any,
+	raw json.RawMessage,
+) {
+	if role == canonical.Role("tool_result") || !e.cachePlan.selected(partPath) {
+		return
+	}
+	encoded, ok := block.(map[string]any)
+	if !ok {
+		e.addLossy(
+			canonical.DiagnosticCacheBreakpointUnsupported,
+			"prompt_cache_breakpoint cannot be attached to an omitted Anthropic content block",
+			extensionPath,
+			raw,
+		)
+		return
+	}
+	if _, exists := encoded["cache_control"]; exists {
+		e.addError(
+			canonical.DiagnosticInvalidCacheControl,
+			"native cache_control conflicts with prompt_cache_breakpoint",
+			extensionPath,
+			raw,
+		)
+		return
+	}
+	encoded["cache_control"] = e.plannedCacheControl(extensionPath)
+}
+
+func (e *requestEncoder) encodeToolResultPromptCacheBreakpoint(
+	result canonical.ToolResult,
+	resultPath string,
+	hasEncodedContent bool,
+	block map[string]any,
+) {
+	if len(result.Content) == 0 {
+		return
+	}
+	partPath := fmt.Sprintf("%s.content.%d", resultPath, len(result.Content)-1)
+	if !e.cachePlan.selected(partPath) {
+		return
+	}
+	extensionPath := partPath + ".extensions.prompt_cache_breakpoint"
+	if !hasEncodedContent {
+		e.addLossy(
+			canonical.DiagnosticCacheBreakpointUnsupported,
+			"tool message breakpoint cannot be attached to an Anthropic tool_result without content",
+			extensionPath,
+			result.Content[len(result.Content)-1].Extensions["prompt_cache_breakpoint"],
+		)
+		return
+	}
+	block["cache_control"] = e.plannedCacheControl(extensionPath)
+}
+
+func (p anthropicPromptCachePlan) selected(path string) bool {
+	if !p.active {
+		return false
+	}
+	_, exists := p.selectedBreakpoints[path]
+	return exists
+}
+
+func (e *requestEncoder) plannedCacheControl(path string) *anthropicCacheControl {
+	return &anthropicCacheControl{Type: "ephemeral", TTL: e.cachePlan.ttl, path: path}
 }
 
 func validateOpenAICacheDirective(name string, raw json.RawMessage) error {
 	var err error
 	switch name {
 	case "prompt_cache_key":
-		var key string
-		key, err = decodeOpenAICacheString(raw, name)
-		if err == nil && strings.TrimSpace(key) == "" {
-			err = fmt.Errorf("prompt_cache_key must be a non-empty string")
-		}
+		_, err = decodeOpenAICacheString(raw, name)
 	case "prompt_cache_options":
 		err = validateOpenAIPromptCacheOptions(raw)
 	case "prompt_cache_retention":
@@ -1004,34 +1231,41 @@ func validateOpenAIPromptCacheRetention(raw json.RawMessage) error {
 }
 
 func validateOpenAIPromptCacheOptions(raw json.RawMessage) error {
+	_, err := decodeOpenAIPromptCacheOptions(raw)
+	return err
+}
+
+func decodeOpenAIPromptCacheOptions(raw json.RawMessage) (openAIPromptCacheOptions, error) {
+	options := openAIPromptCacheOptions{mode: "implicit"}
 	object, err := canonical.DecodeObject(raw)
 	if err != nil {
-		return fmt.Errorf("prompt_cache_options must be an object: %w", err)
+		return openAIPromptCacheOptions{}, fmt.Errorf("prompt_cache_options must be an object: %w", err)
 	}
 	for _, name := range sortedObjectKeys(object) {
 		if name != "mode" && name != "ttl" {
-			return fmt.Errorf("prompt_cache_options contains unsupported field %q", name)
+			return openAIPromptCacheOptions{}, fmt.Errorf("prompt_cache_options contains unsupported field %q", name)
 		}
 	}
 	if modeRaw, exists := object["mode"]; exists {
 		mode, decodeErr := decodeOpenAICacheString(modeRaw, "prompt_cache_options.mode")
 		if decodeErr != nil {
-			return decodeErr
+			return openAIPromptCacheOptions{}, decodeErr
 		}
 		if mode != "implicit" && mode != "explicit" {
-			return fmt.Errorf("prompt_cache_options.mode must be %q or %q", "implicit", "explicit")
+			return openAIPromptCacheOptions{}, fmt.Errorf("prompt_cache_options.mode must be %q or %q", "implicit", "explicit")
 		}
+		options.mode = mode
 	}
 	if ttlRaw, exists := object["ttl"]; exists {
 		ttl, decodeErr := decodeOpenAICacheString(ttlRaw, "prompt_cache_options.ttl")
 		if decodeErr != nil {
-			return decodeErr
+			return openAIPromptCacheOptions{}, decodeErr
 		}
 		if ttl != "30m" {
-			return fmt.Errorf("prompt_cache_options.ttl must be %q", "30m")
+			return openAIPromptCacheOptions{}, fmt.Errorf("prompt_cache_options.ttl must be %q", "30m")
 		}
 	}
-	return nil
+	return options, nil
 }
 
 func validateOpenAIPromptCacheBreakpoint(raw json.RawMessage) error {
@@ -1069,17 +1303,25 @@ func decodeOpenAICacheString(raw json.RawMessage, path string) (string, error) {
 	return value, nil
 }
 
-func validOpenAIPromptCacheBreakpointPosition(part canonical.Part, role canonical.Role) bool {
-	if role == canonical.RoleAssistant || role == canonical.Role("tool_result") {
+func validChatPromptCacheBreakpointPosition(part canonical.Part, role canonical.Role) bool {
+	switch role {
+	case canonical.RoleSystem, canonical.RoleDeveloper, canonical.RoleAssistant, canonical.Role("tool_result"):
+		return part.Kind == canonical.PartText
+	case canonical.RoleUser:
+		return part.Kind == canonical.PartText ||
+			part.Kind == canonical.PartImage ||
+			part.Kind == canonical.PartAudio ||
+			part.Kind == canonical.PartFile
+	default:
 		return false
 	}
-	if part.Kind == canonical.PartText && part.Text == "" {
-		return false
+}
+
+func anthropicPromptCacheBreakpointPosition(part canonical.Part, role canonical.Role) bool {
+	if part.Kind == canonical.PartText {
+		return part.Text != ""
 	}
-	if part.Kind != canonical.PartText && part.Kind != canonical.PartImage && part.Kind != canonical.PartFile {
-		return false
-	}
-	return true
+	return role == canonical.RoleUser && (part.Kind == canonical.PartImage || part.Kind == canonical.PartFile)
 }
 
 func (e *requestEncoder) encodePartCacheControl(raw json.RawMessage, path string, part canonical.Part, role canonical.Role, block any) {

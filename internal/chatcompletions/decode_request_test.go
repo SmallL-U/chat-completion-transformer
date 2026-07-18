@@ -163,7 +163,6 @@ func TestDecodeRequestRecognizesTopLevelCacheExtensions(t *testing.T) {
 	result := DecodeRequest([]byte(`{
 		"model":"general",
 		"messages":[{"role":"user","content":"hello"}],
-		"cache_control":{"type":"ephemeral"},
 		"prompt_cache_key":"tenant:prompt-v1",
 		"prompt_cache_options":{"mode":"explicit","ttl":"30m"},
 		"prompt_cache_retention":"in_memory"
@@ -173,7 +172,6 @@ func TestDecodeRequestRecognizesTopLevelCacheExtensions(t *testing.T) {
 		t.Fatalf("result = %#v", result)
 	}
 	want := map[string]string{
-		"cache_control":          `{"type":"ephemeral"}`,
 		"prompt_cache_key":       `"tenant:prompt-v1"`,
 		"prompt_cache_options":   `{"mode":"explicit","ttl":"30m"}`,
 		"prompt_cache_retention": `"in_memory"`,
@@ -186,67 +184,253 @@ func TestDecodeRequestRecognizesTopLevelCacheExtensions(t *testing.T) {
 	if containsDiagnostic(result.Diagnostics, diagnosticRequestFieldPreserved) {
 		t.Fatalf("diagnostics = %#v", result.Diagnostics)
 	}
+
+	emptyKey := DecodeRequest([]byte(`{"model":"general","messages":[{"role":"user","content":"hello"}],"prompt_cache_key":""}`))
+	if !emptyKey.OK || emptyKey.Value == nil || string(emptyKey.Value.Extensions["prompt_cache_key"]) != `""` {
+		t.Fatalf("empty key result = %#v", emptyKey)
+	}
 }
 
-func TestDecodeRequestAttachesCacheExtensionsToParts(t *testing.T) {
-	result := DecodeRequest([]byte(`{
-		"model":"general",
-		"messages":[{"role":"user","content":[
-			{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}},
-			{"type":"image_url","image_url":{"url":"https://example.com/image.png"},"prompt_cache_breakpoint":{"mode":"explicit"}},
-			{"type":"file","file":{"file_id":"file_123"},"cache_control":{"type":"ephemeral","ttl":"1h"}}
-		]}]
-	}`))
+func TestDecodeRequestAttachesPromptCacheBreakpointsAtOfficialPositions(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		kind    canonical.PartKind
+		tool    bool
+	}{
+		{name: "developer text", message: `{"role":"developer","content":[{"type":"text","text":"developer","prompt_cache_breakpoint":{"mode":"explicit"}}]}`, kind: canonical.PartText},
+		{name: "system text", message: `{"role":"system","content":[{"type":"text","text":"system","prompt_cache_breakpoint":{"mode":"explicit"}}]}`, kind: canonical.PartText},
+		{name: "user text", message: `{"role":"user","content":[{"type":"text","text":"text","prompt_cache_breakpoint":{"mode":"explicit"}}]}`, kind: canonical.PartText},
+		{name: "user image", message: `{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"},"prompt_cache_breakpoint":{"mode":"explicit"}}]}`, kind: canonical.PartImage},
+		{name: "user audio", message: `{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"YXVkaW8=","format":"wav"},"prompt_cache_breakpoint":{"mode":"explicit"}}]}`, kind: canonical.PartAudio},
+		{name: "user file", message: `{"role":"user","content":[{"type":"file","file":{"file_id":"file_123"},"prompt_cache_breakpoint":{"mode":"explicit"}}]}`, kind: canonical.PartFile},
+		{name: "assistant text", message: `{"role":"assistant","content":[{"type":"text","text":"assistant","prompt_cache_breakpoint":{"mode":"explicit"}}]}`, kind: canonical.PartText},
+		{name: "tool text", message: `{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"tool","prompt_cache_breakpoint":{"mode":"explicit"}}]}`, kind: canonical.PartText, tool: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := `{"model":"general","messages":[` + test.message + `]}`
+			result := DecodeRequest([]byte(body))
+			if !result.OK || result.Value == nil || !result.Lossless {
+				t.Fatalf("result = %#v", result)
+			}
+			parts := result.Value.Turns[0].Content
+			if test.tool {
+				parts = result.Value.Turns[0].Results[0].Content
+			}
+			if len(parts) != 1 || parts[0].Kind != test.kind {
+				t.Fatalf("parts = %#v", parts)
+			}
+			if string(parts[0].Extensions["prompt_cache_breakpoint"]) != `{"mode":"explicit"}` {
+				t.Fatalf("part extensions = %#v", parts[0].Extensions)
+			}
+		})
+	}
+}
 
-	if !result.OK || result.Value == nil || !result.Lossless {
+func TestDecodeRequestValidatesPredictionContentBreakpoint(t *testing.T) {
+	const prediction = `{"type":"content","content":[{"type":"text","text":"expected","prompt_cache_breakpoint":{"mode":"explicit"}}]}`
+	result := DecodeRequest([]byte(`{"model":"general","messages":[{"role":"user","content":"hello"}],"prediction":` + prediction + `}`))
+	if !result.OK || result.Value == nil {
 		t.Fatalf("result = %#v", result)
 	}
-	parts := result.Value.Turns[0].Content
-	if len(parts) != 3 {
-		t.Fatalf("parts = %#v", parts)
+	if string(result.Value.Extensions["prediction"]) != prediction {
+		t.Fatalf("prediction = %s", result.Value.Extensions["prediction"])
 	}
-	if string(parts[0].Extensions["cache_control"]) != `{"type":"ephemeral"}` {
-		t.Fatalf("text extensions = %#v", parts[0].Extensions)
+}
+
+func TestDecodeRequestRejectsAnthropicCacheControlAtPublicPositions(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		path string
+	}{
+		{name: "top level", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"cache_control":{"type":"ephemeral"}}`, path: "cache_control"},
+		{name: "content part", body: `{"model":"general","messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}]}`, path: "messages.0.content.0.cache_control"},
+		{name: "image payload", body: `{"model":"general","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png","cache_control":{"type":"ephemeral"}}}]}]}`, path: "messages.0.content.0.image_url.cache_control"},
+		{name: "audio payload", body: `{"model":"general","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA==","format":"wav","cache_control":{"type":"ephemeral"}}}]}]}`, path: "messages.0.content.0.input_audio.cache_control"},
+		{name: "file payload", body: `{"model":"general","messages":[{"role":"user","content":[{"type":"file","file":{"file_id":"file_1","cache_control":{"type":"ephemeral"}}}]}]}`, path: "messages.0.content.0.file.cache_control"},
+		{name: "assistant audio", body: `{"model":"general","messages":[{"role":"assistant","content":"hello","audio":{"id":"audio_1","cache_control":{"type":"ephemeral"}}}]}`, path: "messages.0.audio.cache_control"},
+		{name: "assistant function call", body: `{"model":"general","messages":[{"role":"assistant","content":"hello","function_call":{"name":"lookup","arguments":"{}","cache_control":{"type":"ephemeral"}}}]}`, path: "messages.0.function_call.cache_control"},
+		{name: "tool call function", body: `{"model":"general","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}","cache_control":{"type":"ephemeral"}}}]}]}`, path: "messages.0.tool_calls.0.function.cache_control"},
+		{name: "custom tool call", body: `{"model":"general","messages":[{"role":"assistant","content":"hello","tool_calls":[{"id":"call_1","type":"custom","custom":{"name":"shell","input":"pwd","cache_control":{"type":"ephemeral"}}}]}]}`, path: "messages.0.tool_calls.0.custom.cache_control"},
+		{name: "tool wrapper", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","cache_control":{"type":"ephemeral"},"function":{"name":"lookup"}}]}`, path: "tools.0.cache_control"},
+		{name: "function definition", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"lookup","cache_control":{"type":"ephemeral"}}}]}`, path: "tools.0.function.cache_control"},
+		{name: "custom tool", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"custom","custom":{"name":"shell","cache_control":{"type":"ephemeral"}}}]}`, path: "tools.0.custom.cache_control"},
+		{name: "custom tool format", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"custom","custom":{"name":"shell","format":{"type":"text","cache_control":{"type":"ephemeral"}}}}]}`, path: "tools.0.custom.format.cache_control"},
+		{name: "custom tool grammar", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"custom","custom":{"name":"shell","format":{"type":"grammar","grammar":{"syntax":"lark","definition":"start: WORD","cache_control":{"type":"ephemeral"}}}}}]}`, path: "tools.0.custom.format.grammar.cache_control"},
+		{name: "top audio", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"audio":{"format":"wav","voice":"alloy","cache_control":{"type":"ephemeral"}}}`, path: "audio.cache_control"},
+		{name: "top audio voice", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"audio":{"format":"wav","voice":{"id":"voice_1","cache_control":{"type":"ephemeral"}}}}`, path: "audio.voice.cache_control"},
+		{name: "top function call", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"function_call":{"name":"lookup","cache_control":{"type":"ephemeral"}}}`, path: "function_call.cache_control"},
+		{name: "deprecated function", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"functions":[{"name":"lookup","cache_control":{"type":"ephemeral"}}]}`, path: "functions.0.cache_control"},
+		{name: "moderation", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"moderation":{"model":"omni-moderation-latest","cache_control":{"type":"ephemeral"}}}`, path: "moderation.cache_control"},
+		{name: "moderation policy", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"moderation":{"model":"omni-moderation-latest","policy":{"cache_control":{"type":"ephemeral"}}}}`, path: "moderation.policy.cache_control"},
+		{name: "moderation policy input", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"moderation":{"model":"omni-moderation-latest","policy":{"input":{"mode":"block","cache_control":{"type":"ephemeral"}}}}}`, path: "moderation.policy.input.cache_control"},
+		{name: "moderation policy output", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"moderation":{"model":"omni-moderation-latest","policy":{"output":{"mode":"block","cache_control":{"type":"ephemeral"}}}}}`, path: "moderation.policy.output.cache_control"},
+		{name: "web search", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"web_search_options":{"cache_control":{"type":"ephemeral"}}}`, path: "web_search_options.cache_control"},
+		{name: "web search user location", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"web_search_options":{"user_location":{"type":"approximate","cache_control":{"type":"ephemeral"},"approximate":{"country":"US"}}}}`, path: "web_search_options.user_location.cache_control"},
+		{name: "web search location", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"web_search_options":{"user_location":{"type":"approximate","approximate":{"country":"US","cache_control":{"type":"ephemeral"}}}}}`, path: "web_search_options.user_location.approximate.cache_control"},
+		{name: "tool choice function", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tool_choice":{"type":"function","function":{"name":"lookup","cache_control":{"type":"ephemeral"}}}}`, path: "tool_choice.function.cache_control"},
+		{name: "tool choice custom", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tool_choice":{"type":"custom","custom":{"name":"shell","cache_control":{"type":"ephemeral"}}}}`, path: "tool_choice.custom.cache_control"},
+		{name: "allowed tools choice", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":"auto","cache_control":{"type":"ephemeral"},"tools":[]}}}`, path: "tool_choice.allowed_tools.cache_control"},
+		{name: "allowed tools item", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[{"type":"function","cache_control":{"type":"ephemeral"},"function":{"name":"lookup"}}]}}}`, path: "tool_choice.allowed_tools.tools.0.cache_control"},
+		{name: "allowed function tool choice", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[{"type":"function","function":{"name":"lookup","cache_control":{"type":"ephemeral"}}}]}}}`, path: "tool_choice.allowed_tools.tools.0.function.cache_control"},
+		{name: "allowed custom tool choice", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[{"type":"custom","custom":{"name":"shell","cache_control":{"type":"ephemeral"}}}]}}}`, path: "tool_choice.allowed_tools.tools.0.custom.cache_control"},
+		{name: "allowed custom tool choice format", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[{"type":"custom","custom":{"name":"shell","format":{"type":"text","cache_control":{"type":"ephemeral"}}}}]}}}`, path: "tool_choice.allowed_tools.tools.0.custom.format.cache_control"},
+		{name: "allowed custom tool choice grammar", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[{"type":"custom","custom":{"name":"shell","format":{"type":"grammar","grammar":{"syntax":"lark","definition":"start: WORD","cache_control":{"type":"ephemeral"}}}}}]}}}`, path: "tool_choice.allowed_tools.tools.0.custom.format.grammar.cache_control"},
+		{name: "response format", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"response_format":{"type":"text","cache_control":{"type":"ephemeral"}}}`, path: "response_format.cache_control"},
+		{name: "response JSON schema wrapper", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}}}`, path: "response_format.json_schema.cache_control"},
+		{name: "stream options", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"stream":true,"stream_options":{"include_usage":true,"cache_control":{"type":"ephemeral"}}}`, path: "stream_options.cache_control"},
+		{name: "prediction wrapper", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"prediction":{"type":"content","cache_control":{"type":"ephemeral"},"content":"expected"}}`, path: "prediction.cache_control"},
+		{name: "prediction content", body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"prediction":{"type":"content","content":[{"type":"text","text":"expected","cache_control":{"type":"ephemeral"}}]}}`, path: "prediction.content.0.cache_control"},
 	}
-	if string(parts[1].Extensions["prompt_cache_breakpoint"]) != `{"mode":"explicit"}` {
-		t.Fatalf("image extensions = %#v", parts[1].Extensions)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := DecodeRequest([]byte(test.body))
+			if result.OK || !containsDiagnosticAtPath(result.Diagnostics, canonical.DiagnosticInvalidCacheControl, test.path) {
+				t.Fatalf("result = %#v", result)
+			}
+		})
 	}
-	if string(parts[2].Extensions["cache_control"]) != `{"type":"ephemeral","ttl":"1h"}` {
-		t.Fatalf("file extensions = %#v", parts[2].Extensions)
+}
+
+func TestDecodeRequestAllowsCacheControlAsBusinessData(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "metadata key",
+			body: `{"model":"general","messages":[{"role":"user","content":"hello"}],` +
+				`"metadata":{"cache_control":"business-value"}}`,
+		},
+		{
+			name: "tool input schema property",
+			body: `{"model":"general","messages":[{"role":"user","content":"hello"}],` +
+				`"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"cache_control":{"type":"string"}}}}}]}`,
+		},
+		{
+			name: "response schema property",
+			body: `{"model":"general","messages":[{"role":"user","content":"hello"}],` +
+				`"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object","properties":{"cache_control":{"type":"string"}}}}}}`,
+		},
+		{
+			name: "tool arguments key",
+			body: `{"model":"general","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function",` +
+				`"function":{"name":"lookup","arguments":"{\"cache_control\":{\"type\":\"ephemeral\"}}"}}]}]}`,
+		},
 	}
-	for _, part := range parts {
-		if part.Kind == canonical.PartOpaque {
-			t.Fatalf("cache extension created opaque sibling: %#v", parts)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := DecodeRequest([]byte(test.body))
+			if !result.OK || result.Value == nil || containsDiagnostic(result.Diagnostics, canonical.DiagnosticInvalidCacheControl) {
+				t.Fatalf("result = %#v", result)
+			}
+		})
+	}
+}
+
+func TestDecodeRequestValidatesTopLevelPromptCacheExtensions(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+	}{
+		{name: "key null", field: `"prompt_cache_key":null`},
+		{name: "key wrong type", field: `"prompt_cache_key":42`},
+		{name: "options null", field: `"prompt_cache_options":null`},
+		{name: "options wrong type", field: `"prompt_cache_options":[]`},
+		{name: "options unknown field", field: `"prompt_cache_options":{"future":true}`},
+		{name: "options null mode", field: `"prompt_cache_options":{"mode":null}`},
+		{name: "options wrong mode", field: `"prompt_cache_options":{"mode":"future"}`},
+		{name: "options wrong ttl", field: `"prompt_cache_options":{"ttl":"24h"}`},
+		{name: "retention null", field: `"prompt_cache_retention":null`},
+		{name: "retention wrong type", field: `"prompt_cache_retention":42`},
+		{name: "retention wrong value", field: `"prompt_cache_retention":"forever"`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := `{"model":"general","messages":[{"role":"user","content":"hello"}],` + test.field + `}`
+			result := DecodeRequest([]byte(body))
+			if result.OK || !containsDiagnostic(result.Diagnostics, canonical.DiagnosticInvalidCacheControl) {
+				t.Fatalf("result = %#v", result)
+			}
+		})
+	}
+
+	for _, field := range []string{
+		`"prompt_cache_options":{}`,
+		`"prompt_cache_options":{"mode":"implicit"}`,
+		`"prompt_cache_retention":"24h"`,
+	} {
+		body := `{"model":"general","messages":[{"role":"user","content":"hello"}],` + field + `}`
+		result := DecodeRequest([]byte(body))
+		if !result.OK || result.Value == nil {
+			t.Fatalf("valid field %s: result = %#v", field, result)
 		}
 	}
-	if containsDiagnostic(result.Diagnostics, diagnosticContentFieldPreserved) {
-		t.Fatalf("diagnostics = %#v", result.Diagnostics)
+}
+
+func TestDecodeRequestValidatesPromptCacheBreakpoint(t *testing.T) {
+	tests := []struct {
+		name       string
+		breakpoint string
+		prediction bool
+	}{
+		{name: "null", breakpoint: `null`},
+		{name: "wrong type", breakpoint: `[]`},
+		{name: "missing mode", breakpoint: `{}`},
+		{name: "unknown field", breakpoint: `{"mode":"explicit","future":true}`},
+		{name: "null mode", breakpoint: `{"mode":null}`},
+		{name: "wrong mode", breakpoint: `{"mode":"implicit"}`},
+		{name: "prediction wrong mode", breakpoint: `{"mode":"implicit"}`, prediction: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			content := `{"type":"text","text":"hello","prompt_cache_breakpoint":` + test.breakpoint + `}`
+			body := `{"model":"general","messages":[{"role":"user","content":[` + content + `]}]}`
+			if test.prediction {
+				body = `{"model":"general","messages":[{"role":"user","content":"hello"}],"prediction":{"type":"content","content":[` + content + `]}}`
+			}
+			result := DecodeRequest([]byte(body))
+			if result.OK || !containsDiagnostic(result.Diagnostics, canonical.DiagnosticInvalidCacheControl) {
+				t.Fatalf("result = %#v", result)
+			}
+		})
 	}
 }
 
-func TestDecodeRequestAttachesCacheControlToToolDefinition(t *testing.T) {
-	result := DecodeRequest([]byte(`{
-		"model":"general",
-		"messages":[{"role":"user","content":"hello"}],
-		"tools":[{"type":"function","cache_control":{"type":"ephemeral"},"function":{"name":"lookup"}}]
-	}`))
-	if !result.OK || result.Value == nil || !result.Lossless {
-		t.Fatalf("result = %#v", result)
+func TestDecodeRequestRejectsContentPartsOutsideRoleSchema(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+	}{
+		{name: "developer image", message: `{"role":"developer","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}`},
+		{name: "system file", message: `{"role":"system","content":[{"type":"file","file":{"file_id":"file_123"}}]}`},
+		{name: "user refusal", message: `{"role":"user","content":[{"type":"refusal","refusal":"no"}]}`},
+		{name: "assistant image", message: `{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}`},
+		{name: "assistant mixed text and refusal", message: `{"role":"assistant","content":[{"type":"text","text":"partial"},{"type":"refusal","refusal":"no"}]}`},
+		{name: "assistant multiple refusals", message: `{"role":"assistant","content":[{"type":"refusal","refusal":"no"},{"type":"refusal","refusal":"still no"}]}`},
+		{name: "tool image", message: `{"role":"tool","tool_call_id":"call_1","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}`},
 	}
-	if len(result.Value.Tools) != 1 || string(result.Value.Tools[0].Extensions["cache_control"]) != `{"type":"ephemeral"}` {
-		t.Fatalf("tools = %#v", result.Value.Tools)
-	}
-	if _, exists := result.Value.Extensions["tools"]; exists {
-		t.Fatalf("request extensions = %#v", result.Value.Extensions)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := DecodeRequest([]byte(`{"model":"general","messages":[` + test.message + `]}`))
+			if result.OK || !containsDiagnostic(result.Diagnostics, diagnosticInvalidRequest) {
+				t.Fatalf("result = %#v", result)
+			}
+		})
 	}
 
-	alias := DecodeRequest([]byte(`{
-		"model":"general",
-		"messages":[{"role":"user","content":"hello"}],
-		"tools":[{"type":"function","function":{"name":"lookup","cache_control":{"type":"ephemeral"}}}]
-	}`))
-	if alias.OK || !containsDiagnostic(alias.Diagnostics, canonical.DiagnosticInvalidCacheControl) {
-		t.Fatalf("function.cache_control alias result = %#v", alias)
+	valid := []string{
+		`{"role":"assistant","content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]}`,
+		`{"role":"assistant","content":[{"type":"refusal","refusal":"no"}]}`,
+		`{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"result"}]}`,
+	}
+	for _, message := range valid {
+		result := DecodeRequest([]byte(`{"model":"general","messages":[` + message + `]}`))
+		if !result.OK {
+			t.Fatalf("valid message %s: result = %#v", message, result)
+		}
 	}
 }
 
@@ -267,6 +451,11 @@ func TestDecodeRequestRejectsCacheDirectivesAtInvalidPositions(t *testing.T) {
 			code: canonical.DiagnosticInvalidCacheControl,
 		},
 		{
+			name: "message wrapper breakpoint",
+			body: `{"model":"general","messages":[{"role":"user","content":"hello","prompt_cache_breakpoint":{"mode":"explicit"}}]}`,
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+		{
 			name: "content top-level directive",
 			body: `{"model":"general","messages":[{"role":"user","content":[{"type":"text","text":"hello","prompt_cache_key":"key"}]}]}`,
 			code: canonical.DiagnosticInvalidCacheControl,
@@ -277,14 +466,34 @@ func TestDecodeRequestRejectsCacheDirectivesAtInvalidPositions(t *testing.T) {
 			code: canonical.DiagnosticCacheBreakpointUnsupported,
 		},
 		{
-			name: "nested image directive",
-			body: `{"model":"general","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png","cache_control":{"type":"ephemeral"}}}]}]}`,
-			code: canonical.DiagnosticInvalidCacheControl,
+			name: "nested image breakpoint",
+			body: `{"model":"general","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png","prompt_cache_breakpoint":{"mode":"explicit"}}}]}]}`,
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+		{
+			name: "assistant refusal breakpoint",
+			body: `{"model":"general","messages":[{"role":"assistant","content":[{"type":"refusal","refusal":"no","prompt_cache_breakpoint":{"mode":"explicit"}}]}]}`,
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+		{
+			name: "developer image breakpoint",
+			body: `{"model":"general","messages":[{"role":"developer","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"},"prompt_cache_breakpoint":{"mode":"explicit"}}]}]}`,
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
+		},
+		{
+			name: "prediction non-text breakpoint",
+			body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"prediction":{"type":"content","content":[{"type":"image_url","prompt_cache_breakpoint":{"mode":"explicit"}}]}}`,
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
 		},
 		{
 			name: "tool top-level OpenAI directive",
 			body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","prompt_cache_options":{"mode":"implicit"},"function":{"name":"lookup"}}]}`,
 			code: canonical.DiagnosticInvalidCacheControl,
+		},
+		{
+			name: "tool breakpoint",
+			body: `{"model":"general","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","prompt_cache_breakpoint":{"mode":"explicit"},"function":{"name":"lookup"}}]}`,
+			code: canonical.DiagnosticCacheBreakpointUnsupported,
 		},
 		{
 			name: "assistant tool call directive",
@@ -398,6 +607,15 @@ func TestDecodeRequestRejectsMalformedInput(t *testing.T) {
 func containsDiagnostic(diagnostics []canonical.Diagnostic, code canonical.DiagnosticCode) bool {
 	for _, item := range diagnostics {
 		if item.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func containsDiagnosticAtPath(diagnostics []canonical.Diagnostic, code canonical.DiagnosticCode, path string) bool {
+	for _, item := range diagnostics {
+		if item.Code == code && item.Path != nil && *item.Path == path {
 			return true
 		}
 	}

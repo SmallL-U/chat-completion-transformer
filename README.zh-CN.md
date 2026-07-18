@@ -113,9 +113,22 @@ transformer:
 
 ## Prompt 缓存控制
 
-网关只负责映射供应商的 prompt cache 控制字段，不实现本地缓存。它不会保存 prompt、
-cache key、KV 状态或供应商 cache entry，不会主动注入 cache-write 控制字段，也不会生成
-`prompt_cache_key`；如果上游默认启用自动缓存，供应商侧仍可能自行写入缓存。
+公开的 `POST /v1/chat/completions` 只接受官方 Chat Completions 请求结构。网关只映射
+其中的标准 prompt cache 控制，不实现本地缓存，不保存 prompt、KV 或供应商 cache
+entry，也不会生成 `prompt_cache_key`。
+
+可接受的缓存控制只有：
+
+- 顶层 `prompt_cache_key: string`；
+- 顶层 `prompt_cache_options`，只包含可选的
+  `mode: "implicit" | "explicit"` 和 `ttl: "30m"`；
+- 顶层已 deprecated 的 `prompt_cache_retention: "in_memory" | "24h"`；
+- Chat Completions create schema 明确定义的位置上的
+  `prompt_cache_breakpoint: {"mode":"explicit"}`。
+
+Anthropic `cache_control` 是 Messages 上游字段，在 Chat Completions 请求的顶层、message
+content、tool 或 function 中都不合法。三种 transformer mode 都会在调用上游前以 HTTP
+400 拒绝这类请求。
 
 ### Capability profile
 
@@ -124,23 +137,24 @@ Prompt cache 行为必须显式配置在精确的模型 profile 上。省略 `pr
 
 | `prompt_cache.mode` | 有效目标 | 接受的控制字段 |
 | --- | --- | --- |
-| `none` | 任意有效 profile | 不接受 prompt cache directive |
-| `anthropic` | 直连 Anthropic Messages | 顶层以及 content/tool 上的 `cache_control` |
-| `openai_legacy` | OpenAI Responses | `prompt_cache_key` 和 profile 已启用的 legacy retention 值 |
-| `openai_5_6` | OpenAI Responses | `prompt_cache_key`、`prompt_cache_options` 和 input block 断点 |
+| `none` | 任意有效 profile | 无法表达任何 cache control |
+| `anthropic` | 直连 Anthropic Messages | 将标准 `prompt_cache_options` 和 content breakpoint 转成 `cache_control` |
+| `openai_legacy` | OpenAI Responses | `prompt_cache_key` 和显式启用的 retention 值 |
+| `openai_5_6` | OpenAI Responses | `prompt_cache_key`、`prompt_cache_options`、content breakpoint 和显式启用的 retention 值 |
 
-Legacy retention 值还需要在精确 profile 中分别启用：
+Retention 与 `prompt_cache_options` 相互独立，必须在实际支持它的精确 OpenAI profile 中
+逐项启用：
 
 ```yaml
 prompt_cache:
-  mode: openai_legacy
-  in_memory_retention: true
+  mode: openai_5_6
   extended_retention_24h: true
 ```
 
-这两个布尔值分别允许调用方发送 `prompt_cache_retention: "in_memory"` 和
-`prompt_cache_retention: "24h"`，不会替调用方选择或注入 retention 值。
-`in-memory` 等其他拼写不会被自动改写为别名。
+`in_memory_retention` 和 `extended_retention_24h` 分别允许调用方发送
+`prompt_cache_retention: "in_memory"` 和 `prompt_cache_retention: "24h"`，不会替调用方
+选择或注入 retention 值。示例只启用当前较新 OpenAI 模型支持的 `24h`；实际配置只应
+启用该上游模型支持的值，`in-memory` 等其他拼写不会被自动改写为别名。
 
 已知缓存字段会经过类型校验和 capability gate。字段结构或位置非法时，请求会被
 拒绝；合法字段但目标 profile 不支持时，`strict` 模式失败，`compatible` 和
@@ -149,27 +163,15 @@ prompt_cache:
 
 ### Anthropic Messages
 
-顶层 `cache_control` 用于开启 Anthropic 自动 prompt caching。省略 `ttl` 时使用
-供应商默认的 5 分钟 TTL；网关接受的显式值为 `5m` 和 `1h`。
+客户端仍然发送标准 Chat Completions 请求。例如显式缓存断点应写成：
 
 ```json
 {
   "model": "anthropic-example",
-  "cache_control": {
-    "type": "ephemeral",
-    "ttl": "1h"
+  "prompt_cache_options": {
+    "mode": "explicit",
+    "ttl": "30m"
   },
-  "messages": [
-    {"role": "user", "content": "你好"}
-  ]
-}
-```
-
-显式断点保留在原 Chat Completions content block，或放在 `tools[*]` 外层：
-
-```json
-{
-  "model": "anthropic-example",
   "messages": [
     {
       "role": "system",
@@ -177,33 +179,35 @@ prompt_cache:
         {
           "type": "text",
           "text": "较长且稳定的系统指令",
-          "cache_control": {"type": "ephemeral"}
+          "prompt_cache_breakpoint": {"mode": "explicit"}
         }
       ]
     },
     {"role": "user", "content": "你好"}
-  ],
-  "tools": [
-    {
-      "type": "function",
-      "cache_control": {"type": "ephemeral", "ttl": "1h"},
-      "function": {
-        "name": "lookup",
-        "description": "查询一个值",
-        "parameters": {"type": "object"}
-      }
-    }
   ]
 }
 ```
 
-`function.cache_control` 不作为别名接受。在 Anthropic `tool_use`、`tool_result`
-wrapper 或 tool result 内嵌 content 上放置 cache control 也不属于当前网关支持范围。
+Anthropic encoder 只在上游 Messages JSON 中生成原生 `cache_control`：
+
+- `mode: "implicit"` 生成顶层 automatic cache control；
+- `mode: "explicit"` 不生成顶层 automatic control；
+- 标准 content breakpoint 转成原生 content-block control；
+- Chat 默认或显式的 30 分钟最短 TTL 映射为 Anthropic `1h`，因为 `5m` 无法满足
+  调用方请求的最短生命周期；
+- implicit mode 在 automatic marker 之外写入最新三个显式 marker，explicit mode 写入
+  最新四个；
+- 没有标准 cache control 的请求不会被主动开启缓存。
+
+`prompt_cache_key` 和 `prompt_cache_retention` 都没有等价的 Anthropic per-request 字段。
+strict mode 会拒绝这种保真损失，compatible/emulate mode 会告警并丢弃。Chat tool
+definition 没有缓存字段，因此公开 API 不暴露 Anthropic tool `cache_control`。
 
 ### OpenAI Responses
 
-两种 OpenAI profile 代际都接受调用方提供的非空 `prompt_cache_key`。需要共享同一稳定
-前缀的请求应复用稳定 key，不要使用每次都不同的 request ID。
+两种 OpenAI profile 代际都会转发调用方提供的 string `prompt_cache_key`。Chat schema
+没有非空约束，但实际使用时仍应让共享同一稳定前缀的请求复用有意义的稳定 key，不要
+使用每次都不同的 request ID。
 
 Legacy 示例：
 
@@ -244,9 +248,13 @@ GPT-5.6+ 显式 input 断点示例：
 }
 ```
 
-GPT-5.6+ 断点只允许出现在 input text、image 和 file block。Legacy profile 拒绝
-`prompt_cache_options` 和 block breakpoint；GPT-5.6+ profile 拒绝
-`prompt_cache_retention`。
+GPT-5.6+ profile 会转发 `prompt_cache_options` 和可由 Responses 表达的 content
+breakpoint；legacy profile 不支持这两个控制。两种 profile 都只转发 capability flag
+明确启用的 `prompt_cache_retention` 枚举值；该字段与 `prompt_cache_options` 保持独立。
+
+公开 decoder 只在 Chat Completions create schema 定义的位置接受 breakpoint。如果合法
+的 Chat content part 无法由选中的 Responses profile 表达，strict mode 会失败，
+compatible/emulate mode 会告警并丢弃该 breakpoint，不会把断点移动到另一个边界。
 
 ### Usage 与运行提示
 
@@ -277,8 +285,8 @@ Completions usage 结构返回明细：
 供应商决定，usage 明细只是可观察结果。
 
 以下能力明确延期，当前不宣称支持：通过 Anthropic `max_tokens: 0` 预热缓存、由 route
-注入缓存策略、自动选择断点、自动派生或分片 key、Bedrock/Vertex 缓存行为、命中率或
-成本报表、供应商缓存删除/失效 API，以及把 `previous_response_id`、`conversation` 或
+注入缓存策略、派生新断点、自动派生或分片 key、Bedrock/Vertex 缓存行为、命中率或成本
+报表、供应商缓存删除/失效 API，以及把 `previous_response_id`、`conversation` 或
 `store` 当作 prompt cache 控制。
 
 运行检查并启动服务：

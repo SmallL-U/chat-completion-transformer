@@ -135,12 +135,16 @@ func TestRegistryValidatesPromptCacheProfiles(t *testing.T) {
 			},
 		},
 		{
-			name: "openai 5.6",
+			name: "openai 5.6 retention flags",
 			profile: Profile{
-				Provider:    ProviderOpenAI,
-				Endpoint:    EndpointResponses,
-				Model:       "openai-56",
-				PromptCache: PromptCacheCapabilities{Mode: PromptCacheOpenAI56},
+				Provider: ProviderOpenAI,
+				Endpoint: EndpointResponses,
+				Model:    "openai-56",
+				PromptCache: PromptCacheCapabilities{
+					Mode:                 PromptCacheOpenAI56,
+					InMemoryRetention:    true,
+					ExtendedRetention24h: true,
+				},
 			},
 		},
 		{
@@ -174,12 +178,12 @@ func TestRegistryValidatesPromptCacheProfiles(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "retention flags on 5.6",
+			name: "retention flags without OpenAI cache mode",
 			profile: Profile{
 				Provider:    ProviderOpenAI,
 				Endpoint:    EndpointResponses,
 				Model:       "bad-flags",
-				PromptCache: PromptCacheCapabilities{Mode: PromptCacheOpenAI56, InMemoryRetention: true},
+				PromptCache: PromptCacheCapabilities{Mode: PromptCacheNone, InMemoryRetention: true},
 			},
 			wantErr: true,
 		},

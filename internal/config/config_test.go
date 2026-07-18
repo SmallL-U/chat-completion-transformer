@@ -107,7 +107,7 @@ func TestLoadPromptCacheYAML(t *testing.T) {
 	configYAML := strings.Replace(
 		validYAML,
 		"      content:\n",
-		"      prompt_cache:\n        mode: \"openai_5_6\"\n      content:\n",
+		"      prompt_cache:\n        mode: \"openai_5_6\"\n        in_memory_retention: true\n        extended_retention_24h: true\n      content:\n",
 		1,
 	)
 
@@ -117,8 +117,8 @@ func TestLoadPromptCacheYAML(t *testing.T) {
 	}
 
 	cache := config.Transformer.Profiles[0].PromptCache
-	if cache.Mode != capabilities.PromptCacheOpenAI56 {
-		t.Fatalf("PromptCache = %+v, want OpenAI 5.6 mode", cache)
+	if cache.Mode != capabilities.PromptCacheOpenAI56 || !cache.InMemoryRetention || !cache.ExtendedRetention24h {
+		t.Fatalf("PromptCache = %+v, want OpenAI 5.6 mode with both retention flags", cache)
 	}
 }
 
@@ -368,8 +368,8 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 				profiles: `[{"provider":"anthropic","endpoint":"messages","model":"claude-test","prompt_cache":{"mode":"openai_5_6"}}]`,
 			},
 			{
-				name:     "retention flag outside legacy mode",
-				profiles: `[{"provider":"openai","endpoint":"responses","model":"gpt-test","prompt_cache":{"mode":"openai_5_6","in_memory_retention":true}}]`,
+				name:     "retention flag outside OpenAI cache mode",
+				profiles: `[{"provider":"openai","endpoint":"responses","model":"gpt-test","prompt_cache":{"mode":"none","in_memory_retention":true}}]`,
 			},
 		}
 

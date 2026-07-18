@@ -118,11 +118,24 @@ or fragments are rejected, and redirects are not followed.
 
 ## Prompt cache control
 
-The gateway maps provider prompt-cache directives; it does not implement a
-local cache. It never stores prompts, cache keys, KV state, or provider cache
-entries, does not inject cache-write directives, and does not generate a
-`prompt_cache_key`. Provider-side automatic caching can still apply when it is
-the upstream default.
+The public `POST /v1/chat/completions` endpoint accepts only the official Chat
+Completions request shape. The gateway maps its standard prompt-cache controls;
+it does not implement a local cache, store prompts or provider cache entries,
+or generate a `prompt_cache_key`.
+
+The accepted cache controls are:
+
+- top-level `prompt_cache_key: string`;
+- top-level `prompt_cache_options`, containing only optional
+  `mode: "implicit" | "explicit"` and `ttl: "30m"`;
+- top-level deprecated `prompt_cache_retention: "in_memory" | "24h"`;
+- `prompt_cache_breakpoint: {"mode":"explicit"}` on the content parts where
+  the Chat Completions create schema defines it.
+
+Anthropic's `cache_control` is an upstream Messages field. It is never valid in
+a Chat Completions request, including at the request, message content, tool, or
+function level. Such a request is rejected with HTTP 400 in every transformer
+mode; the gateway never forwards it upstream.
 
 ### Capability profiles
 
@@ -132,24 +145,26 @@ to infer an API generation.
 
 | `prompt_cache.mode` | Valid target | Accepted controls |
 | --- | --- | --- |
-| `none` | Any valid profile | No prompt-cache directive |
-| `anthropic` | Direct Anthropic Messages | Top-level and content/tool `cache_control` |
-| `openai_legacy` | OpenAI Responses | `prompt_cache_key` and enabled legacy retention values |
-| `openai_5_6` | OpenAI Responses | `prompt_cache_key`, `prompt_cache_options`, and input block breakpoints |
+| `none` | Any valid profile | No cache control can be represented |
+| `anthropic` | Direct Anthropic Messages | Standard `prompt_cache_options` and content breakpoints are translated to `cache_control` |
+| `openai_legacy` | OpenAI Responses | `prompt_cache_key` and explicitly enabled retention values |
+| `openai_5_6` | OpenAI Responses | `prompt_cache_key`, `prompt_cache_options`, content breakpoints, and explicitly enabled retention values |
 
-Legacy retention values must also be enabled by the exact profile:
+Retention values are independent of `prompt_cache_options` and must be enabled
+individually on the exact OpenAI profile that supports them:
 
 ```yaml
 prompt_cache:
-  mode: openai_legacy
-  in_memory_retention: true
+  mode: openai_5_6
   extended_retention_24h: true
 ```
 
-These booleans permit callers to send `prompt_cache_retention: "in_memory"`
-and `prompt_cache_retention: "24h"`, respectively; they do not choose or inject
-a retention value. `in-memory` and other spellings are not rewritten as
-aliases.
+`in_memory_retention` and `extended_retention_24h` permit callers to send
+`prompt_cache_retention: "in_memory"` and `prompt_cache_retention: "24h"`,
+respectively; they do not choose or inject a retention value. The example only
+enables `24h`, as current newer OpenAI models do. Enable only values supported
+by that exact upstream model. `in-memory` and other spellings are not rewritten
+as aliases.
 
 Known cache directives are type-checked and gated by the selected profile.
 Malformed values and invalid placements are rejected. A valid directive that
@@ -159,29 +174,16 @@ fields are never passed through.
 
 ### Anthropic Messages
 
-Top-level `cache_control` enables Anthropic automatic prompt caching. Omitting
-`ttl` selects the provider's default 5-minute TTL; the explicit values supported
-by the gateway are `5m` and `1h`.
+Clients still send a standard Chat Completions request. For example, an
+explicit cache breakpoint is written as:
 
 ```json
 {
   "model": "anthropic-example",
-  "cache_control": {
-    "type": "ephemeral",
-    "ttl": "1h"
+  "prompt_cache_options": {
+    "mode": "explicit",
+    "ttl": "30m"
   },
-  "messages": [
-    {"role": "user", "content": "Hello"}
-  ]
-}
-```
-
-Explicit breakpoints stay on their original Chat Completions content block or
-on the outer `tools[*]` wrapper:
-
-```json
-{
-  "model": "anthropic-example",
   "messages": [
     {
       "role": "system",
@@ -189,35 +191,39 @@ on the outer `tools[*]` wrapper:
         {
           "type": "text",
           "text": "Large stable instructions",
-          "cache_control": {"type": "ephemeral"}
+          "prompt_cache_breakpoint": {"mode": "explicit"}
         }
       ]
     },
     {"role": "user", "content": "Hello"}
-  ],
-  "tools": [
-    {
-      "type": "function",
-      "cache_control": {"type": "ephemeral", "ttl": "1h"},
-      "function": {
-        "name": "lookup",
-        "description": "Look up a value",
-        "parameters": {"type": "object"}
-      }
-    }
   ]
 }
 ```
 
-`function.cache_control` is not accepted as an alias. Cache control on
-Anthropic `tool_use` or `tool_result` wrappers, and on content nested inside a
-tool result, is outside the current gateway scope.
+The Anthropic encoder then generates native `cache_control` only in the
+upstream Messages JSON:
+
+- `mode: "implicit"` generates top-level automatic cache control;
+- `mode: "explicit"` does not generate top-level automatic control;
+- standard content breakpoints become native content-block controls;
+- Chat's default or explicit `30m` minimum TTL becomes Anthropic `1h`, because
+  Anthropic `5m` would not satisfy the requested minimum lifetime;
+- implicit mode writes the latest three explicit markers in addition to the
+  automatic marker; explicit mode writes the latest four;
+- a request with no standard cache control does not gain one.
+
+`prompt_cache_key` and `prompt_cache_retention` have no exact Anthropic
+per-request equivalent. Strict mode rejects that fidelity loss;
+compatible/emulate mode warns and drops those fields. Chat tool definitions do
+not have a cache field, so the gateway does not expose Anthropic tool
+`cache_control` through the public API.
 
 ### OpenAI Responses
 
-Both OpenAI profile generations accept a caller-supplied, non-empty
-`prompt_cache_key`. Reuse a stable key for requests intended to share the same
-stable prefix; do not use a unique request ID.
+Both OpenAI profile generations forward a caller-supplied string
+`prompt_cache_key`. The Chat schema does not impose a non-empty constraint, but
+a stable, meaningful key should be reused for requests intended to share a
+prefix instead of using a unique request ID.
 
 Legacy example:
 
@@ -258,9 +264,17 @@ GPT-5.6+ example with an explicit input breakpoint:
 }
 ```
 
-GPT-5.6+ breakpoints are accepted only on input text, image, and file blocks.
-Legacy profiles reject `prompt_cache_options` and block breakpoints; GPT-5.6+
-profiles reject `prompt_cache_retention`.
+GPT-5.6+ profiles forward `prompt_cache_options` and representable content
+breakpoints. Legacy profiles do not support those two controls. Both profile
+generations forward only the `prompt_cache_retention` enum values explicitly
+enabled by their capability flags; the field remains independent of
+`prompt_cache_options`.
+
+The public decoder accepts breakpoints only at positions defined by the Chat
+Completions create schema. If a valid Chat content part cannot be represented
+by the selected Responses profile, strict mode fails and compatible/emulate
+mode warns and drops that breakpoint rather than moving it to a different
+boundary.
 
 ### Usage and operational notes
 
@@ -294,9 +308,9 @@ whether an entry is written, retained, and reused, and usage details are the
 observable result.
 
 The following remain deliberately unsupported: cache warm-up through Anthropic
-`max_tokens: 0`, route-injected cache policies, automatic breakpoint selection,
-automatic key derivation or sharding, Bedrock/Vertex cache behavior, hit-rate or
-cost reporting, provider cache deletion/invalidation APIs, and treating
+`max_tokens: 0`, route-injected cache policies, derived breakpoints, automatic
+key derivation or sharding, Bedrock/Vertex cache behavior, hit-rate or cost
+reporting, provider cache deletion/invalidation APIs, and treating
 `previous_response_id`, `conversation`, or `store` as prompt-cache controls.
 
 Run the checks and start the server:
